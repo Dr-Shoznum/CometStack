@@ -7,6 +7,7 @@
 #include <pjsr/FrameStyle.jsh>
 #include <pjsr/Sizer.jsh>
 #include <pjsr/ColorSpace.jsh>
+#include <pjsr/TextAlign.jsh>
 
 /*
  * CometStack - one-shot comet stacking for OSC (color) cameras.
@@ -36,16 +37,120 @@
  *    precise box on a magnified crop - no other window ever needs focus.
  */
 
-// ---- UI helpers -------------------------------------------------------------
+// ---- UI & error helpers ----------------------------------------------------
 
-// Visually marks a button as "do this next" (solid accent color, bold white
-// text) or clears it back to the platform default. Used to make the
-// step-by-step flow self-evident instead of relying on the user to read
-// status labels to figure out what to click next.
+function pad2(n) {
+   return (n < 10 ? "0" : "") + n;
+}
+
+function formatDuration(seconds) {
+   let total = Math.max(0, Math.round(seconds));
+   if (total < 60) return total + "s";
+   let mins = Math.floor(total / 60);
+   let secs = total % 60;
+   return mins + "m " + secs + "s";
+}
+
 function setHighlight(button, on) {
    button.styleSheet = on
-      ? "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
-      : "";
+      ? "QPushButton { background-color: #2e7d32; color: #ffffff; font-weight: bold; padding: 6px 10px; border-radius: 3px; }"
+      : "QPushButton { padding: 6px 10px; }";
+}
+
+function showErrorDialog(title, err, logFn) {
+   let msg = (err && err.message) ? err.message : String(err);
+   let detail = (err && err.stack) ? ("\n\nDetails:\n" + err.stack) : "";
+   if (logFn) logFn("ERROR [" + title + "]: " + msg);
+   let mb = new MessageBox(
+      msg + detail,
+      "CometStack — " + title,
+      StdIcon_Error,
+      StdButton_Ok
+   );
+   mb.execute();
+}
+
+function showInfoDialog(parent) {
+   let infoDlg = new Dialog(parent);
+   infoDlg.windowTitle = "CometStack — Requirements & Process Guide";
+   infoDlg.minWidth = 620;
+   infoDlg.minHeight = 460;
+
+   let titleLbl = new Label(infoDlg);
+   titleLbl.text = "OSC Comet Stacking — Setup & Process Rundown";
+   titleLbl.styleSheet = "font-size: 12pt; font-weight: bold;";
+
+   let readmeText =
+      "WHAT YOU NEED IN PIXINSIGHT\n" +
+      "------------------------------------------------------------\n" +
+      "• StarNet2 module installed and configured in PixInsight (required\n" +
+      "  both to strip stars from comet-aligned frames and to isolate stars\n" +
+      "  from the reference frame).\n" +
+      "• Standard PixInsight core/modules: AutomaticBackgroundExtractor,\n" +
+      "  ImageCalibration, Debayer, StarAlignment, CometAlignment,\n" +
+      "  ImageIntegration, and PixelMath.\n" +
+      "• At least 3 OSC (color) light frames (.fits, .fit, or .xisf) with\n" +
+      "  valid DATE-OBS timestamps in their headers.\n" +
+      "• Optional calibration folder: point to the ROOT folder containing\n" +
+      "  subfolders named 'dark', 'flat', and/or 'bias' (exact lowercase\n" +
+      "  singular names — e.g. CalibLibrary/dark/, CalibLibrary/flat/,\n" +
+      "  CalibLibrary/bias/, not 'Darks'/'Flats'/'Biases'). Subfolders\n" +
+      "  inside those are allowed. Frames are matched by camera, gain,\n" +
+      "  binning, exposure, and detector temperature (with master flats\n" +
+      "  skipped if multiple IR modes are ambiguous).\n\n" +
+      "HOW THE STACKING PROCESS WORKS\n" +
+      "------------------------------------------------------------\n" +
+      "1. Calibration (Optional): Matches dark, flat, and bias frames to your\n" +
+      "   light metadata and runs ImageCalibration into 0_calibrated/.\n" +
+      "2. Debayer & StarAlignment: Converts OSC frames to color (_d.xisf)\n" +
+      "   and aligns stars to the first frame (_r.xisf), then sorts frames\n" +
+      "   chronologically by Julian Date derived from DATE-OBS.\n" +
+      "3. Nucleus Marking (First & Last Frame): Opens an embedded picker\n" +
+      "   with AutomaticBackgroundExtractor + screen stretch so you can click\n" +
+      "   roughly on the nucleus, zoom in, and drag a box around it on the\n" +
+      "   first and last frames. A brightness-weighted centroid refines each\n" +
+      "   position, and stacking begins automatically after frame 2.\n" +
+      "4. CometAlignment (Custom JD Interpolation): Computes linear nucleus\n" +
+      "   positions across frames by Julian Date and passes every frame as\n" +
+      "   'fixed' to CometAlignment (_ca.xisf), avoiding PixInsight's broken\n" +
+      "   built-in non-fixed interpolation.\n" +
+      "5. Batch StarNet2 Removal: Runs StarNet2 on each comet-aligned frame\n" +
+      "   (_sn.xisf), monitors nucleus peak brightness for over-removal\n" +
+      "   warnings, and calls processEvents() + gc() between frames to\n" +
+      "   prevent memory/stability crashes.\n" +
+      "6. Starless Comet Integration: Integrates the starless comet frames\n" +
+      "   into 'cometStackLayer' so the comet and tail stack cleanly without\n" +
+      "   star trails.\n" +
+      "7. Star Isolation & Screen Blend: Runs StarNet2 on a copy of the\n" +
+      "   star-aligned reference frame, isolates stars via:\n" +
+      "      max(0, refStarsLayer - refStarlessLayer)\n" +
+      "   and screen-blends them over the comet stack via:\n" +
+      "      1 - (1 - cometStackLayer) * (1 - starsOnlyLayer)\n" +
+      "   Finally applies an AutoSTF preview stretch and saves\n" +
+      "   CometStack_final.xisf in the working folder.";
+
+   let docBox = new TextBox(infoDlg);
+   docBox.readOnly = true;
+   docBox.text = readmeText;
+   docBox.setMinSize(580, 360);
+   docBox.styleSheet = "font-family: monospace; font-size: 9pt;";
+
+   let okBtn = new PushButton(infoDlg);
+   okBtn.text = "Got It";
+   okBtn.onClick = function() { infoDlg.ok(); };
+
+   let btnSizer = new HorizontalSizer;
+   btnSizer.addStretch();
+   btnSizer.add(okBtn);
+
+   infoDlg.sizer = new VerticalSizer;
+   infoDlg.sizer.margin = 12;
+   infoDlg.sizer.spacing = 8;
+   infoDlg.sizer.add(titleLbl);
+   infoDlg.sizer.add(docBox, 100);
+   infoDlg.sizer.add(btnSizer);
+   infoDlg.adjustToContents();
+   infoDlg.execute();
 }
 
 // ---- Math / stats / file helpers -------------------------------------------
@@ -130,7 +235,8 @@ function weightedCentroidNative(image, rect) {
       image.getSamples(buf, rect, ch);
       for (let i = 0; i < buf.length; ++i) acc[i] += buf[i];
    }
-   let minV = Math.min.apply(null, acc);
+   let minV = acc.length > 0 ? acc[0] : 0;
+   for (let i = 1; i < acc.length; ++i) if (acc[i] < minV) minV = acc[i];
    let sumW = 0, sumX = 0, sumY = 0;
    for (let yy = 0; yy < hh; ++yy) {
       for (let xx = 0; xx < ww; ++xx) {
@@ -149,6 +255,7 @@ function MTF(m, x) {
    if (x == m) return 0.5;
    return ((m - 1) * x) / (((2 * m - 1) * x) - m);
 }
+
 function applyAutoSTF(view, sclip, tbgnd) {
    let n = view.image.isColor ? 3 : 1;
    let median = view.computeOrFetchProperty("Median");
@@ -172,13 +279,6 @@ function applyAutoSTF(view, sclip, tbgnd) {
    view.stf = stf;
 }
 
-// [avgMedian, c0] - the expensive part of a stretch (a full-image statistics
-// scan). Computed once per opened frame. This mirrors PixInsight's own
-// "linked" STF algorithm (its Ctrl+A default, from the canonical ApplyAutoSTF
-// reference script): each channel's median and MAD are computed SEPARATELY,
-// then the per-channel medians are averaged and the per-channel shadow
-// points (median_c - shadowsClipping*MAD_c) are averaged - producing one
-// shared [c0, m] pair applied to every channel.
 function computeChannelStats(image, n) {
    let fullRect = new Rect(0, 0, image.width, image.height);
    let SHADOWS_CLIP = 2.8;
@@ -192,8 +292,6 @@ function computeChannelStats(image, n) {
    return [sumMedian / n, sumC0 / n];
 }
 
-// Cheap: turn the cached (linked) stats + a target background into a single
-// MTF stretch [m, c0, c1], applied identically to every channel.
 function finalizeStretch(stats, targetBkg) {
    let avgMedian = stats[0], c0 = Math.min(1, Math.max(0, stats[1]));
    let m = (c0 >= 1) ? 0.0001 : MTF(targetBkg, avgMedian - c0);
@@ -285,11 +383,23 @@ function renderFromPrepared(prepared, stretch) {
    return result;
 }
 
+function closeNewAbeBackgroundWindows(beforeIds) {
+   let wins = ImageWindow.windows;
+   for (let i = 0; i < wins.length; ++i) {
+      let id = wins[i].mainView.id;
+      if (beforeIds.indexOf(id) < 0 && /_ABE_background$/i.test(id)) {
+         wins[i].forceClose();
+      }
+   }
+}
+
 function runBackgroundExtraction(view) {
+   let beforeIds = ImageWindow.windows.map(function(w) { return w.mainView.id; });
    let P = new AutomaticBackgroundExtractor;
    P.targetCorrection = 1; // Correction_Subtract
    P.replaceTarget = true;
    P.executeOn(view);
+   closeNewAbeBackgroundWindows(beforeIds);
 }
 
 function pickNucleus(filePath, title, subtitle) {
@@ -317,8 +427,10 @@ function pickNucleus(filePath, title, subtitle) {
 
    let info = new Label(dlg);
    info.text = (subtitle ? subtitle + "\n" : "") + OVERVIEW_HINT;
+   info.textAlignment = TextAlign_Center;
    info.wordWrapping = true;
-   info.minHeight = 48;
+   info.minHeight = 52;
+   info.styleSheet = "QLabel { color: #d32f2f; font-size: 11pt; font-weight: bold; }";
 
    let view = new Control(dlg);
    view.setFixedSize(VIEWW, VIEWH);
@@ -390,8 +502,8 @@ function pickNucleus(filePath, title, subtitle) {
    };
 
    dlg.sizer = new VerticalSizer;
-   dlg.sizer.margin = 8;
-   dlg.sizer.spacing = 6;
+   dlg.sizer.margin = 10;
+   dlg.sizer.spacing = 8;
    dlg.sizer.add(info);
    dlg.sizer.add(view);
    dlg.adjustToContents();
@@ -619,13 +731,22 @@ function runCometAlignment(entries, workDir, x0, y0, x1, y1) {
    return listFiles(outDir, /_ca\.xisf$/i);
 }
 
-function runStarNet2Batch(files, workDir, nucleusX, nucleusY) {
+function runStarNet2Batch(files, workDir, nucleusX, nucleusY, logFn) {
    let outDir = workDir + "/4_starless";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
    clearDirFiles(outDir);
 
+   if (logFn) {
+      logFn("   NOTE: StarNet2 star removal can take a very long time depending on your computer's speed and image size.");
+   }
+
    let warnings = [];
+   let firstFrameSec = null;
+
    for (let i = 0; i < files.length; ++i) {
+      let tStart = Date.now();
+      if (logFn) logFn("   StarNet2 [" + (i + 1) + "/" + files.length + "]: " + File.extractName(files[i]));
+      processEvents();
       let w = ImageWindow.open(files[i])[0];
       let before = peakInRegion(w.mainView, nucleusX, nucleusY, 40);
       let P = new StarNet2;
@@ -633,10 +754,24 @@ function runStarNet2Batch(files, workDir, nucleusX, nucleusY) {
       P.linear = true;
       P.executeOn(w.mainView);
       let after = peakInRegion(w.mainView, nucleusX, nucleusY, 40);
-      if (before > 0 && after / before < 0.4)
-         warnings.push(File.extractName(files[i]) + ": nucleus dropped to " + (100 * after / before).toFixed(0) + "% of its original brightness");
+      if (before > 0 && after / before < 0.4) {
+         let warnMsg = File.extractName(files[i]) + ": nucleus dropped to " + (100 * after / before).toFixed(0) + "% of original brightness";
+         warnings.push(warnMsg);
+         if (logFn) logFn("   WARNING: " + warnMsg);
+      }
       w.saveAs(outDir + "/" + File.extractName(files[i]) + "_sn.xisf", false, false, false, false);
       w.forceClose();
+
+      let elapsedSec = (Date.now() - tStart) / 1000;
+      if (i === 0) {
+         firstFrameSec = elapsedSec;
+         let remainingFrames = files.length - 1;
+         if (logFn && remainingFrames > 0) {
+            let estRemainingSec = firstFrameSec * remainingFrames;
+            logFn("   First frame took " + formatDuration(firstFrameSec) + ". Estimated time remaining for " + remainingFrames + " frame(s): ~" + formatDuration(estRemainingSec) + ".");
+         }
+      }
+
       processEvents();
       gc();
    }
@@ -663,6 +798,7 @@ function runIntegration(files) {
 function combine(refStarPath, cometWindow, workDir) {
    let starWin = ImageWindow.open(refStarPath)[0];
    let starlessWin = ImageWindow.open(refStarPath)[0];
+   let keepCometWindow = false;
    try {
       let sn = new StarNet2;
       sn.mask = false;
@@ -692,12 +828,16 @@ function combine(refStarPath, cometWindow, workDir) {
          blendPM.showNewImage = true;
          blendPM.rescale = false;
          blendPM.truncate = true;
-         if (!blendPM.executeOn(cometWindow.mainView)) throw new Error("PixelMath screen blend failed.");
+         if (!blendPM.executeOn(cometWindow.mainView)) {
+            keepCometWindow = true;
+            throw new Error("PixelMath screen blend failed.");
+         }
          return ImageWindow.windowById("CometStack_final");
       } finally {
          if (starsOnlyWin) starsOnlyWin.forceClose();
       }
    } finally {
+      if (!keepCometWindow && cometWindow) cometWindow.forceClose();
       starlessWin.forceClose();
       starWin.forceClose();
    }
@@ -716,69 +856,117 @@ function CometStackDialog() {
    this.nucleusFirst = null;
    this.nucleusLast = null;
    this.calibLibrary = [];
+   this.isRunning = false;
+   this.isCompleted = false;
 
    this.windowTitle = "OSC Comet Stacking";
-   this.minWidth = 460;
+   this.minWidth = 540;
    this.position = new Point(100, 100);
 
-   this.creditLabel = new Label(this);
-   this.creditLabel.text = "by Petar Milevski (2026)";
-   this.creditLabel.styleSheet = "font-style: italic; color: gray;";
-   this.creditLabel.margin = 6;
+   this.log = function(line) {
+      let now = new Date();
+      let stamp = "[" + pad2(now.getHours()) + ":" + pad2(now.getMinutes()) + ":" + pad2(now.getSeconds()) + "] ";
+      let cur = dlg.logBox.text;
+      dlg.logBox.text = cur ? (cur + "\n" + stamp + line) : (stamp + line);
+      processEvents();
+   };
 
-   // Step 0 (optional): point at a calibration library root
-   this.step0Button = new PushButton(this);
-   this.step0Button.text = "(Optional) Select calibration frames folder...";
+   this.setControlsBusy = function(busy) {
+      dlg.isRunning = busy;
+      dlg.step0Button.enabled = !busy;
+      dlg.step1Button.enabled = !busy;
+      dlg.step2Button.enabled = !busy && !dlg.isCompleted && dlg.orderedEntries.length >= 3;
+      dlg.closeButton.enabled = !busy;
+   };
+
+   // Header + Info button right next to heading title
+   this.headerLabel = new Label(this);
+   this.headerLabel.text = "OSC Comet Stacking";
+   this.headerLabel.styleSheet = "font-size: 13pt; font-weight: bold;";
+
+   this.infoButton = new PushButton(this);
+   this.infoButton.text = "Info / Process";
+   this.infoButton.toolTip = "View PixInsight requirements (such as StarNet2) and a rundown of how stacking works";
+   this.infoButton.styleSheet = "QPushButton { padding: 3px 8px; font-size: 9pt; }";
+   this.infoButton.onClick = function() {
+      showInfoDialog(dlg);
+   };
+
+   let headerSizer = new HorizontalSizer;
+   headerSizer.spacing = 8;
+   headerSizer.add(this.headerLabel);
+   headerSizer.add(this.infoButton);
+   headerSizer.addStretch();
+
+   this.creditLabel = new Label(this);
+   this.creditLabel.text = "by Petar Milevski (2026)  •  Automated post-nucleus stack & screen blend";
+   this.creditLabel.styleSheet = "font-style: italic; color: #777777;";
+
+   // Group 1: Inputs & Preparation
+   this.prepGroup = new GroupBox(this);
+   this.prepGroup.title = "1. Calibration & Light Frames";
+
+   this.step0Button = new PushButton(this.prepGroup);
+   this.step0Button.text = "Select Calibration Folder (Optional)...";
+   setHighlight(this.step0Button, false);
    this.step0Button.onClick = function() {
       let gdd = new GetDirectoryDialog;
       gdd.caption = "Select folder containing dark/flat/bias frames";
       if (!gdd.execute()) return;
-      dlg.step0Button.enabled = false;
+
+      dlg.setControlsBusy(true);
       dlg.status0.text = "Scanning calibration library...";
-      processEvents();
+      dlg.log("Scanning calibration library: " + gdd.directory);
       try {
          dlg.calibLibrary = scanCalibrationLibrary(gdd.directory);
          let nDark = dlg.calibLibrary.filter(function(r) { return r.kind == "dark"; }).length;
          let nFlat = dlg.calibLibrary.filter(function(r) { return r.kind == "flat"; }).length;
          let nBias = dlg.calibLibrary.filter(function(r) { return r.kind == "bias"; }).length;
-         dlg.status0.text = "Library: " + nDark + " dark, " + nFlat + " flat, " + nBias +
-            " bias file(s) found. Matched automatically against your lights in step 1.";
+         let summary = "Library: " + nDark + " dark, " + nFlat + " flat, " + nBias + " bias file(s) ready.";
+         dlg.status0.text = summary;
+         dlg.log(summary);
       } catch (e) {
-         dlg.status0.text = "ERROR scanning: " + e.message;
          dlg.calibLibrary = [];
+         dlg.status0.text = "Calibration scan failed.";
+         showErrorDialog("Calibration Scan", e, dlg.log);
       } finally {
-         dlg.step0Button.enabled = true;
+         dlg.setControlsBusy(false);
       }
    };
-   this.status0 = new Label(this);
-   this.status0.text = "No calibration folder selected (optional - lights used uncalibrated).";
-   this.status0.wordWrapping = true;
 
-   // Step 1: pick folder, then calibrate (if matched) + Debayer + StarAlignment
-   this.step1Button = new PushButton(this);
-   this.step1Button.text = "1. Select light frames folder...";
+   this.status0 = new Label(this.prepGroup);
+   this.status0.text = "No calibration folder selected (lights will run uncalibrated).";
+   this.status0.wordWrapping = true;
+   this.status0.styleSheet = "color: #666666;";
+
+   this.step1Button = new PushButton(this.prepGroup);
+   this.step1Button.text = "Select Light Frames Folder...";
+   setHighlight(this.step1Button, true);
    this.step1Button.onClick = function() {
       let gdd = new GetDirectoryDialog;
       gdd.caption = "Select folder containing light frames";
       if (!gdd.execute()) return;
 
-      dlg.step1Button.enabled = false;
+      dlg.isCompleted = false;
+      setHighlight(dlg.closeButton, false);
+      dlg.setControlsBusy(true);
       dlg.inputFiles = listFiles(gdd.directory, /\.(fits|fit|xisf)$/i);
       dlg.workDir = gdd.directory + "/CometStack_work";
       if (dlg.inputFiles.length < 3) {
-         dlg.status1.text = "Only " + dlg.inputFiles.length + " files found - need at least 3.";
-         dlg.step1Button.enabled = true;
+         let msg = "Found " + dlg.inputFiles.length + " frame(s); at least 3 are required.";
+         dlg.status1.text = msg;
+         dlg.setControlsBusy(false);
+         showErrorDialog("Insufficient Frames", new Error(msg), dlg.log);
          return;
       }
 
-      dlg.status1.text = dlg.inputFiles.length + " files found.";
-      processEvents();
+      dlg.log("Found " + dlg.inputFiles.length + " light frames. Work folder: " + dlg.workDir);
       try {
          let filesToDebayer = dlg.inputFiles;
 
          if (dlg.calibLibrary.length > 0) {
             dlg.status1.text = "Matching calibration frames...";
-            processEvents();
+            dlg.log("Matching calibration frames against light metadata...");
             let lightMeta = readFrameMeta(dlg.inputFiles[0]);
             let temps = dlg.inputFiles.map(function(p) { return readFrameMeta(p).temp; }).filter(function(t) { return t != null; });
             let avgTemp = temps.length ? (temps.reduce(function(a, b) { return a + b; }, 0) / temps.length) : lightMeta.temp;
@@ -795,109 +983,128 @@ function CometStackDialog() {
             if (darkMatch) {
                darkPath = materializeMasterFrame({ path: darkMatch.path, exptime: darkMatch.usedExptime, gain: lightMeta.gain, bin: lightMeta.bin, temp: null }, dlg.workDir, "dark");
                msgs.push("dark " + (darkMatch.approxExptime ? "(closest exptime " + darkMatch.usedExptime + "s) " : "") +
-                  "@ " + darkMatch.tempDiff.toFixed(0) + "C off target");
-            } else msgs.push("no matching dark");
+                  "@ " + darkMatch.tempDiff.toFixed(0) + "°C diff");
+            } else msgs.push("no dark");
             if (biasRec) {
                biasPath = materializeMasterFrame(biasRec, dlg.workDir, "bias");
-               msgs.push("bias found");
-            } else msgs.push("no matching bias");
+               msgs.push("bias matched");
+            } else msgs.push("no bias");
             if (flatMatch && !flatMatch.ambiguous) {
                flatPath = materializeMasterFrame(flatMatch.record, dlg.workDir, "flat");
-               msgs.push("flat found");
-            } else if (flatMatch && flatMatch.ambiguous) msgs.push("flat skipped (ambiguous IR mode)");
-            else msgs.push("no matching flat");
+               msgs.push("flat matched");
+            } else if (flatMatch && flatMatch.ambiguous) msgs.push("flat skipped (ambiguous IR)");
+            else msgs.push("no flat");
 
+            dlg.log("Calibration match: " + msgs.join(", "));
             if (darkPath || biasPath || flatPath) {
-               dlg.status1.text = "Calibration: " + msgs.join(", ") + ". Calibrating lights...";
-               processEvents();
+               dlg.status1.text = "Calibrating (" + msgs.join(", ") + ")...";
+               dlg.log("Running ImageCalibration...");
                filesToDebayer = runCalibration(dlg.inputFiles, dlg.workDir, darkPath, biasPath, flatPath);
             } else {
-               dlg.status1.text = "Calibration: " + msgs.join(", ") + ". Proceeding uncalibrated.";
+               dlg.log("No applicable calibration frames matched; proceeding uncalibrated.");
             }
-            processEvents();
          }
 
-         dlg.status1.text += " Running Debayer...";
-         processEvents();
+         dlg.status1.text = "Running Debayer...";
+         dlg.log("Running Debayer on " + filesToDebayer.length + " frames...");
          let debayered = runDebayer(filesToDebayer, dlg.workDir);
-         dlg.status1.text = dlg.inputFiles.length + " files: running StarAlignment...";
-         processEvents();
+
+         dlg.status1.text = "Running StarAlignment...";
+         dlg.log("Running StarAlignment on " + debayered.length + " debayered frames...");
          let aligned = runStarAlignment(debayered, dlg.workDir);
+
+         dlg.log("Sorting aligned frames chronologically by DATE-OBS...");
          dlg.orderedEntries = sortFilesChronologically(aligned);
 
-         dlg.status1.text = dlg.orderedEntries.length + " frames aligned and ordered by time.";
+         let doneMsg = dlg.orderedEntries.length + " frames aligned & ordered.";
+         dlg.status1.text = doneMsg;
+         dlg.log(doneMsg);
+
          setHighlight(dlg.step1Button, false);
          dlg.step2Button.enabled = true;
          setHighlight(dlg.step2Button, true);
       } catch (e) {
-         dlg.status1.text = "ERROR: " + e.message;
+         dlg.status1.text = "Preparation failed.";
+         showErrorDialog("Light Preparation", e, dlg.log);
       } finally {
-         dlg.step1Button.enabled = true;
+         dlg.setControlsBusy(false);
+         if (!dlg.isCompleted && dlg.orderedEntries.length >= 3) {
+            setHighlight(dlg.step2Button, true);
+         }
       }
    };
-   this.status1 = new Label(this);
-   this.status1.text = "No folder selected yet.";
-   this.status1.wordWrapping = true;
-   setHighlight(this.step1Button, true);
 
-   // Step 2: mark the nucleus in the first frame, then the last frame
-   this.step2Button = new PushButton(this);
-   this.step2Button.text = "2. Mark nucleus (first, then last frame)...";
+   this.status1 = new Label(this.prepGroup);
+   this.status1.text = "Waiting for light frames folder.";
+   this.status1.wordWrapping = true;
+
+   this.prepGroup.sizer = new VerticalSizer;
+   this.prepGroup.sizer.margin = 10;
+   this.prepGroup.sizer.spacing = 6;
+   this.prepGroup.sizer.add(this.step0Button);
+   this.prepGroup.sizer.add(this.status0);
+   this.prepGroup.sizer.addSpacing(4);
+   this.prepGroup.sizer.add(this.step1Button);
+   this.prepGroup.sizer.add(this.status1);
+
+   // Group 2: Nucleus Marking -> Auto-Run Comet Stack
+   this.cometGroup = new GroupBox(this);
+   this.cometGroup.title = "2. Comet Nucleus & Automatic Stacking";
+
+   this.step2Button = new PushButton(this.cometGroup);
+   this.step2Button.text = "Mark Nucleus (First, then Last Frame) & Run";
    this.step2Button.enabled = false;
+   setHighlight(this.step2Button, false);
+
+   this.status2 = new Label(this.cometGroup);
+   this.status2.text = "Complete step 1 to enable nucleus selection.";
+   this.status2.wordWrapping = true;
+
    this.step2Button.onClick = function() {
-      dlg.step2Button.enabled = false;
+      dlg.setControlsBusy(true);
+      setHighlight(dlg.step2Button, false);
       try {
          let firstPath = dlg.orderedEntries[0].path;
          let lastPath = dlg.orderedEntries[dlg.orderedEntries.length - 1].path;
 
+         dlg.log("Opening first frame for nucleus selection...");
          let r1 = pickNucleus(firstPath, "Mark comet nucleus", "Frame 1 of 2 (FIRST frame in chronological sequence)");
-         if (!r1) { dlg.status2.text = "Cancelled."; return; }
+         if (!r1) {
+            dlg.status2.text = "Cancelled on first frame.";
+            dlg.log("Nucleus selection cancelled on first frame.");
+            return;
+         }
          dlg.nucleusFirst = r1;
-         dlg.status2.text = "First-frame nucleus: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + "). Now the last frame...";
-         processEvents();
+         dlg.status2.text = "First: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ") — select last frame...";
+         dlg.log("First nucleus marked at (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ").");
 
          let r2 = pickNucleus(lastPath, "Mark comet nucleus", "Frame 2 of 2 (LAST frame in chronological sequence)");
-         if (!r2) { dlg.status2.text = "Cancelled after marking the first frame - click this button again to redo both."; return; }
+         if (!r2) {
+            dlg.status2.text = "Cancelled on last frame — click button again to redo both.";
+            dlg.log("Nucleus selection cancelled on second frame.");
+            return;
+         }
          dlg.nucleusLast = r2;
-         dlg.status2.text = "First: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ")  Last: (" + r2[0].toFixed(1) + ", " + r2[1].toFixed(1) + ")";
-         setHighlight(dlg.step2Button, false);
-         dlg.step3Button.enabled = true;
-         setHighlight(dlg.step3Button, true);
-      } catch (e) {
-         dlg.status2.text = "ERROR: " + e.message;
-      } finally {
-         dlg.step2Button.enabled = true;
-      }
-   };
-   this.status2 = new Label(this);
-   this.status2.text = "";
-   this.status2.wordWrapping = true;
-
-   // Step 3: run the rest of the pipeline
-   this.step3Button = new PushButton(this);
-   this.step3Button.text = "3. Run Comet Stack";
-   this.step3Button.enabled = false;
-   this.step3Button.onClick = function() {
-      dlg.step3Button.enabled = false;
-      try {
-         setHighlight(dlg.step3Button, false);
-         dlg.status3.text = "Running CometAlignment...";
+         dlg.status2.text = "First: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ")  |  Last: (" + r2[0].toFixed(1) + ", " + r2[1].toFixed(1) + ")";
+         dlg.log("Last nucleus marked at (" + r2[0].toFixed(1) + ", " + r2[1].toFixed(1) + "). Starting Comet Stack automatically...");
          processEvents();
+
+         dlg.status2.text = "Running CometAlignment...";
+         dlg.log("Running CometAlignment...");
          let caFiles = runCometAlignment(dlg.orderedEntries, dlg.workDir,
             dlg.nucleusFirst[0], dlg.nucleusFirst[1], dlg.nucleusLast[0], dlg.nucleusLast[1]);
+         dlg.log("CometAlignment produced " + caFiles.length + " aligned frames.");
 
-         dlg.status3.text = "Removing stars (StarNet2) from " + caFiles.length + " frames...";
-         processEvents();
-         let sn = runStarNet2Batch(caFiles, dlg.workDir, dlg.nucleusFirst[0], dlg.nucleusFirst[1]);
-         if (sn.warnings.length > 0)
-            dlg.status3.text = "Warning: " + sn.warnings.join("; ");
+         dlg.status2.text = "Running StarNet2 on " + caFiles.length + " frames...";
+         dlg.log("Removing stars with StarNet2...");
+         let sn = runStarNet2Batch(caFiles, dlg.workDir, dlg.nucleusFirst[0], dlg.nucleusFirst[1], dlg.log);
 
-         dlg.status3.text += "\nIntegrating comet stack...";
-         processEvents();
+         dlg.status2.text = "Integrating starless comet frames...";
+         dlg.log("Running ImageIntegration on starless frames...");
          let cometWin = runIntegration(sn.files);
 
-         dlg.status3.text += "\nIsolating stars and combining layers...";
-         processEvents();
+         dlg.status2.text = "Isolating stars and screen-blending...";
+         dlg.log("Isolating reference stars and blending over comet stack...");
          let finalWin = combine(dlg.orderedEntries[0].path, cometWin, dlg.workDir);
          applyAutoSTF(finalWin.mainView, 2.8, 0.25);
          finalWin.zoomToFit();
@@ -906,39 +1113,68 @@ function CometStackDialog() {
 
          let savePath = dlg.workDir + "/CometStack_final.xisf";
          finalWin.saveAs(savePath, false, false, false, false);
-         dlg.status3.text = "Done. Saved to " + savePath +
-            (sn.warnings.length > 0 ? "\n\nWarnings:\n" + sn.warnings.join("\n") : "");
+         dlg.status2.text = "Completed! Saved to " + savePath;
+         dlg.log("Finished! Final image saved to: " + savePath);
+         dlg.isCompleted = true;
          setHighlight(dlg.closeButton, true);
       } catch (e) {
-         dlg.status3.text = "ERROR: " + e.message;
-         setHighlight(dlg.step3Button, true);
+         dlg.status2.text = "Stacking failed — see error dialog or log.";
+         showErrorDialog("Comet Stack", e, dlg.log);
       } finally {
-         dlg.step3Button.enabled = true;
+         dlg.setControlsBusy(false);
+         if (!dlg.isRunning && !dlg.isCompleted && dlg.orderedEntries.length >= 3) {
+            setHighlight(dlg.step2Button, true);
+         } else if (dlg.isCompleted) {
+            setHighlight(dlg.step2Button, false);
+            setHighlight(dlg.closeButton, true);
+         }
       }
    };
-   this.status3 = new Label(this);
-   this.status3.text = "";
-   this.status3.wordWrapping = true;
 
+   this.cometGroup.sizer = new VerticalSizer;
+   this.cometGroup.sizer.margin = 10;
+   this.cometGroup.sizer.spacing = 6;
+   this.cometGroup.sizer.add(this.step2Button);
+   this.cometGroup.sizer.add(this.status2);
+
+   // Group 3: Live Process Log
+   this.logGroup = new GroupBox(this);
+   this.logGroup.title = "Process Activity Log";
+
+   this.logBox = new TextBox(this.logGroup);
+   this.logBox.readOnly = true;
+   this.logBox.setFixedHeight(165);
+   this.logBox.styleSheet = "font-family: monospace; font-size: 9pt;";
+
+   this.logGroup.sizer = new VerticalSizer;
+   this.logGroup.sizer.margin = 10;
+   this.logGroup.sizer.spacing = 6;
+   this.logGroup.sizer.add(this.logBox);
+
+   // Footer
    this.closeButton = new PushButton(this);
    this.closeButton.text = "Close";
-   this.closeButton.onClick = function() { dlg.ok(); };
+   setHighlight(this.closeButton, false);
+   this.closeButton.onClick = function() {
+      if (!dlg.isRunning) dlg.ok();
+   };
+
+   let footerSizer = new HorizontalSizer;
+   footerSizer.addStretch();
+   footerSizer.add(this.closeButton);
 
    this.sizer = new VerticalSizer;
-   this.sizer.margin = 8;
-   this.sizer.spacing = 6;
+   this.sizer.margin = 12;
+   this.sizer.spacing = 8;
+   this.sizer.add(headerSizer);
    this.sizer.add(this.creditLabel);
-   this.sizer.addSpacing(8);
-   this.sizer.add(this.step0Button);
-   this.sizer.add(this.status0);
-   this.sizer.add(this.step1Button);
-   this.sizer.add(this.status1);
-   this.sizer.add(this.step2Button);
-   this.sizer.add(this.status2);
-   this.sizer.add(this.step3Button);
-   this.sizer.add(this.status3);
-   this.sizer.addSpacing(8);
-   this.sizer.add(this.closeButton);
+   this.sizer.add(this.prepGroup);
+   this.sizer.add(this.cometGroup);
+   this.sizer.add(this.logGroup);
+   this.sizer.add(footerSizer);
+   this.adjustToContents();
+
+   this.log("Ready. Select a light frames folder to begin.");
 }
 CometStackDialog.prototype = new Dialog;
 
