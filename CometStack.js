@@ -14,8 +14,8 @@
  * Workflow: Debayer -> StarAlignment -> mark nucleus in first/last frame
  * (via a self-contained click-to-zoom-then-drag picker, entirely inside this
  * dialog - no need to interact with separate PixInsight image windows) ->
- * CometAlignment -> StarNet2 -> ImageIntegration -> PixelMath combine with
- * the reference frame's original stars.
+ * CometAlignment -> StarNet2 -> ImageIntegration -> stars-only isolation and
+ * screen blend with the comet stack.
  *
  * Real bugs found and worked around while building this against actual
  * DWARF mini + real comet data:
@@ -48,12 +48,14 @@ function setHighlight(button, on) {
       : "";
 }
 
-// ---- Math / stats helpers --------------------------------------------------
+// ---- Math / stats / file helpers -------------------------------------------
 
 function toJD(isoStr) {
-   let m = isoStr.match(/(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)/);
+   if (!isoStr) throw new Error("Missing DATE-OBS metadata.");
+   let m = isoStr.match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d+(?:\.\d+)?)/);
+   if (!m) throw new Error("Unrecognized DATE-OBS format: '" + isoStr + "'");
    let year = parseInt(m[1], 10), month = parseInt(m[2], 10), day = parseInt(m[3], 10);
-   let hour = parseInt(m[4], 10), minute = parseInt(m[5], 10), second = parseInt(m[6], 10);
+   let hour = parseInt(m[4], 10), minute = parseInt(m[5], 10), second = parseFloat(m[6]);
    let a = Math.floor((14 - month) / 12);
    let y = year + 4800 - a;
    let mm = month + 12 * a - 3;
@@ -64,23 +66,45 @@ function toJD(isoStr) {
 function readDateObs(window) {
    for (let k = 0; k < window.keywords.length; ++k)
       if (window.keywords[k].name == "DATE-OBS")
-         return window.keywords[k].value.replace(/'/g, "").trim();
+         return window.keywords[k].value.toString().replace(/'/g, "").trim();
    return "";
 }
 
-function listFiles(dir, pattern) {
+function readDateObsFromFile(path) {
+   let w = ImageWindow.open(path)[0];
+   let d = readDateObs(w);
+   w.forceClose();
+   return d;
+}
+
+function listFiles(dir, regex) {
    let ff = new FileFind;
    let files = [];
-   if (ff.begin(dir + "/" + pattern)) {
-      do { if (!ff.isDirectory) files.push(dir + "/" + ff.name); } while (ff.next());
+   if (ff.begin(dir + "/*")) {
+      do {
+         if (!ff.isDirectory && (!regex || regex.test(ff.name)))
+            files.push(dir + "/" + ff.name);
+      } while (ff.next());
    }
    files.sort();
    return files;
 }
 
+function clearDirFiles(dir) {
+   if (!File.directoryExists(dir)) return;
+   let existing = listFiles(dir, null);
+   for (let i = 0; i < existing.length; ++i) {
+      if (File.exists(existing[i])) File.remove(existing[i]);
+   }
+}
+
 function peakInRegion(view, cx, cy, halfsize) {
    let img = view.image;
-   let rect = new Rect(Math.round(cx - halfsize), Math.round(cy - halfsize), Math.round(cx + halfsize), Math.round(cy + halfsize));
+   let x0 = Math.max(0, Math.min(img.width - 1, Math.round(cx - halfsize)));
+   let y0 = Math.max(0, Math.min(img.height - 1, Math.round(cy - halfsize)));
+   let x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(cx + halfsize)));
+   let y1 = Math.max(y0 + 1, Math.min(img.height, Math.round(cy + halfsize)));
+   let rect = new Rect(x0, y0, x1, y1);
    let n = img.numberOfChannels;
    let ww = rect.x1 - rect.x0, hh = rect.y1 - rect.y0;
    let acc = new Float64Array(ww * hh);
@@ -114,6 +138,7 @@ function weightedCentroidNative(image, rect) {
          sumW += v; sumX += v * (rect.x0 + xx); sumY += v * (rect.y0 + yy);
       }
    }
+   if (sumW <= 0) return [(rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2];
    return [sumX / sumW, sumY / sumW];
 }
 
@@ -153,13 +178,7 @@ function applyAutoSTF(view, sclip, tbgnd) {
 // reference script): each channel's median and MAD are computed SEPARATELY,
 // then the per-channel medians are averaged and the per-channel shadow
 // points (median_c - shadowsClipping*MAD_c) are averaged - producing one
-// shared [c0, m] pair applied to every channel. The shadow point must be
-// SUBTRACTED below the median (not added above it) so it sits on the dark
-// side of the background - getting this backwards once made avgMedian - c0
-// go negative, which forces MTF() to always return 0 and crushes the whole
-// background to black except for star peaks. An earlier version also pooled
-// every channel's raw pixel VALUES into one combined array and took a single
-// global median/MAD of that, which isn't what PixInsight does either.
+// shared [c0, m] pair applied to every channel.
 function computeChannelStats(image, n) {
    let fullRect = new Rect(0, 0, image.width, image.height);
    let SHADOWS_CLIP = 2.8;
@@ -182,18 +201,7 @@ function finalizeStretch(stats, targetBkg) {
 }
 
 // ---- Nucleus picker rendering ----------------------------------------------
-//
-// Each preview (overview or zoom) is built in two phases: prepareOverviewData()/
-// prepareZoomData() read the actual pixel data (once per frame, once per
-// click), and renderFromPrepared() applies a plain autostretch to it and
-// renders a Bitmap - no other processing layered on top, so what's shown
-// for picking the nucleus is a straightforward autostretch of the real
-// image.
 
-// Downscaled raw (unstretched) channel data for the whole frame, using
-// box-averaging (not nearest-neighbor) so single-pixel sensor/read noise is
-// suppressed and the comet's diffuse coma is easier to spot than in a raw
-// 1:1 view.
 function prepareOverviewData(image, maxW) {
    let n = image.numberOfChannels;
    let scale = Math.min(1, maxW / image.width);
@@ -222,15 +230,11 @@ function prepareOverviewData(image, maxW) {
    return { channels: channels, n: n, outW: outW, outH: outH, scale: scale };
 }
 
-// Magnified raw (unstretched) crop of a small native-pixel region around
-// (cx, cy). Plain nearest-neighbor magnification of the real pixel data -
-// no blur or other noise-reduction processing, so what's shown for picking
-// the nucleus is a straightforward autostretch of the actual image, nothing
-// else layered on top.
 function prepareZoomData(image, cx, cy, halfSize, zoomFactor) {
    let n = image.numberOfChannels;
-   let cropW = 2 * halfSize, cropH = 2 * halfSize;
-   let x0 = Math.round(cx - halfSize), y0 = Math.round(cy - halfSize);
+   let cropW = Math.min(image.width, 2 * halfSize);
+   let cropH = Math.min(image.height, 2 * halfSize);
+   let x0 = Math.round(cx - cropW / 2), y0 = Math.round(cy - cropH / 2);
    x0 = Math.max(0, Math.min(image.width - cropW, x0));
    y0 = Math.max(0, Math.min(image.height - cropH, y0));
    let cropRect = new Rect(x0, y0, x0 + cropW, y0 + cropH);
@@ -239,9 +243,6 @@ function prepareZoomData(image, cx, cy, halfSize, zoomFactor) {
    for (let c = 0; c < n; ++c) {
       let buf = new Float32Array(cropW * cropH);
       image.getSamples(buf, cropRect, c);
-      // Nearest-neighbor magnify from crop resolution up to the zoomed
-      // output size - renderFromPrepared() expects channel arrays already
-      // sized outW*outH, same convention as prepareOverviewData().
       let magnified = new Float32Array(outW * outH);
       for (let yy = 0; yy < outH; ++yy) {
          let sy = Math.min(cropH - 1, Math.floor(yy / zoomFactor));
@@ -255,16 +256,6 @@ function prepareZoomData(image, cx, cy, halfSize, zoomFactor) {
    return { channels: channels, n: n, outW: outW, outH: outH, cropW: cropW, cropH: cropH, x0: x0, y0: y0, zoomFactor: zoomFactor };
 }
 
-// Applies the fixed autostretch to already-prepared raw channel data and
-// renders it to a Bitmap.
-//
-// Uses PixInsight's own HistogramTransformation process (via a small
-// temporary image window) rather than a hand-rolled per-pixel MTF loop -
-// an earlier manual implementation looked visibly worse (murkier, harder to
-// pick a faint comet out of) than PixInsight's native stretch on the same
-// data with the same computed parameters, for reasons not fully tracked
-// down. Using the real process guarantees the same look users already know
-// from PixInsight itself.
 function renderFromPrepared(prepared, stretch) {
    let small = new Image(prepared.outW, prepared.outH, prepared.n, prepared.n > 1 ? ColorSpace_RGB : ColorSpace_Gray);
    for (let c = 0; c < prepared.n; ++c)
@@ -275,13 +266,9 @@ function renderFromPrepared(prepared, stretch) {
    tmpWin.mainView.image.assign(small);
    tmpWin.mainView.endProcess();
 
-   // Same [m, c0, c1] triple applied to each of R/G/B (PixInsight's "linked"
-   // STF behavior) - see computeChannelStats(). The RGB/K row (index 3) and
-   // alpha row (index 4) must stay identity: HistogramTransformation applies
-   // H[3] as an ADDITIONAL pass on top of the per-channel R/G/B rows, so
-   // setting it to the same non-identity curve double-applies the stretch
-   // and blows the image out to near-white.
-   let hEntry = [stretch[1], stretch[0], stretch[2], 0, 1]; // [c0, m, c1, r0, r1]
+   // RGB/K row (index 3) and alpha row (index 4) stay identity so
+   // HistogramTransformation does not double-apply the curve.
+   let hEntry = [stretch[1], stretch[0], stretch[2], 0, 1];
    let identity = [0, 0.5, 1, 0, 1];
    let H = prepared.n > 1 ? [hEntry, hEntry, hEntry, identity, identity]
                            : [hEntry, hEntry, hEntry, hEntry, identity];
@@ -298,29 +285,13 @@ function renderFromPrepared(prepared, stretch) {
    return result;
 }
 
-// Runs AutomaticBackgroundExtractor (subtraction mode, in place) on a view
-// before it's used for nucleus-picking. This is what actually fixes the
-// uncalibrated color cast, rather than the stretch itself trying to
-// compensate for it: ABE models and subtracts each channel's own background
-// level independently, so afterward every channel sits near zero background
-// and a plain stretch shows a clean neutral background with stars/comet
-// visible in natural color - not a manual white-balance hack layered on top
-// of the raw data.
 function runBackgroundExtraction(view) {
    let P = new AutomaticBackgroundExtractor;
-   P.targetCorrection = 1; // Correction_Subtract (verified: toSource() confirms 1 = Subtract)
-   P.replaceTarget = true; // modify this view in place instead of creating a separate "_ABE" window
+   P.targetCorrection = 1; // Correction_Subtract
+   P.replaceTarget = true;
    P.executeOn(view);
 }
 
-// Self-contained nucleus picker: click roughly on the comet to zoom in, then
-// drag a small precise box around it - releasing the drag confirms and
-// closes the dialog immediately (no separate Confirm button). A tap without
-// dragging while zoomed in goes back to the full-frame view to re-pick (no
-// separate Back button either). Closing the dialog (native X / Escape)
-// cancels. Returns [x, y] in native image pixel coordinates, or null if
-// cancelled. Never shows or requires interacting with any other PixInsight
-// window.
 function pickNucleus(filePath, title, subtitle) {
    let w = ImageWindow.open(filePath)[0];
    runBackgroundExtraction(w.mainView);
@@ -329,17 +300,11 @@ function pickNucleus(filePath, title, subtitle) {
 
    const VIEWW = 900, VIEWH = 640;
    const ZOOM_HALFSIZE = 110, ZOOM_FACTOR = 3;
-   const TAP_TOLERANCE = 6; // px - drags smaller than this count as a tap, not a selection
+   const TAP_TOLERANCE = 6;
 
    let dlg = new Dialog;
    dlg.windowTitle = title;
 
-   // Fixed PixInsight-standard auto-STF stretch (target background 0.25,
-   // the same default the real Screen Transfer Function tool uses) -
-   // computed once and used for both the overview and every zoom crop. An
-   // earlier version exposed this as a user-adjustable slider, but that
-   // control never behaved reliably, and the standard auto-stretch already
-   // shows a faint coma clearly enough on real data.
    const TARGET_BKG = 0.25;
    let channelStats = computeChannelStats(img, img.numberOfChannels);
    let stretch = finalizeStretch(channelStats, TARGET_BKG);
@@ -360,13 +325,13 @@ function pickNucleus(filePath, title, subtitle) {
 
    view.onPaint = function(x0, y0, x1, y1) {
       let g = new Graphics(this);
-      g.fillRect(0, 0, VIEWW, VIEWH, new Brush(4278190080)); // opaque black
+      g.fillRect(0, 0, VIEWW, VIEWH, new Brush(4278190080));
       if (state.mode == "overview") {
          g.drawBitmap(0, 0, state.overview.bitmap);
       } else if (state.zoom) {
          g.drawBitmap(0, 0, state.zoom.bitmap);
          if (state.dragStart && state.dragCur) {
-            g.pen = new Pen(4294901760, 2); // opaque red
+            g.pen = new Pen(4294901760, 2);
             let rx0 = Math.min(state.dragStart.x, state.dragCur.x);
             let ry0 = Math.min(state.dragStart.y, state.dragCur.y);
             let rx1 = Math.max(state.dragStart.x, state.dragCur.x);
@@ -408,7 +373,6 @@ function pickNucleus(filePath, title, subtitle) {
          let rx1 = Math.max(state.dragStart.x, state.dragCur.x);
          let ry1 = Math.max(state.dragStart.y, state.dragCur.y);
          if (rx1 - rx0 >= TAP_TOLERANCE && ry1 - ry0 >= TAP_TOLERANCE) {
-            // A real drag: pin down the nucleus box and confirm right away.
             let z = state.zoom;
             let nx0 = z.x0 + rx0 / z.zoomFactor, ny0 = z.y0 + ry0 / z.zoomFactor;
             let nx1 = z.x0 + rx1 / z.zoomFactor, ny1 = z.y0 + ry1 / z.zoomFactor;
@@ -416,7 +380,6 @@ function pickNucleus(filePath, title, subtitle) {
             result = weightedCentroidNative(img, rect);
             dlg.ok();
          } else {
-            // Just a tap: go back to the full frame to re-pick.
             state.mode = "overview";
             state.dragStart = null; state.dragCur = null;
             info.text = (subtitle ? subtitle + "\n" : "") + OVERVIEW_HINT;
@@ -439,15 +402,6 @@ function pickNucleus(filePath, title, subtitle) {
 }
 
 // ---- Calibration library scanning ------------------------------------------
-//
-// A calibration root folder can hold a mix of ready-to-use master frames
-// (whose filenames encode exp/gain/bin/temp/ir, e.g.
-// "dark_exp_15.000000_gain_60_bin_1_20C_stack_17.fits" - these have stripped
-// FITS headers, so metadata comes from the filename) and folders of raw
-// individual subs (generic names like "tele_0000.fits", full FITS headers,
-// "ir" mode only recoverable from the containing folder name). Everything
-// is matched against the actual light frames' own header values; if nothing
-// matches, that calibration step is simply skipped.
 
 function readFrameMeta(path) {
    let w = ImageWindow.open(path)[0];
@@ -477,7 +431,7 @@ function classifyCalibFile(path, rootDir) {
    let name = File.extractName(path);
    let gain = null, bin_ = null, exptime = null, temp = null, ir = null, isMaster = false, m;
 
-   if (kind == "dark" && (m = name.match(/dark_exp_([\d.]+)_gain_(\d+)_bin_(\d+)_(\d+)C_stack_(\d+)/i))) {
+   if (kind == "dark" && (m = name.match(/dark_exp_([\d.]+)_gain_(\d+)_bin_(\d+)_(-?\d+)C_stack_(\d+)/i))) {
       exptime = parseFloat(m[1]); gain = parseInt(m[2], 10); bin_ = parseInt(m[3], 10); temp = parseFloat(m[4]);
       isMaster = true;
    } else if (kind == "flat" && (m = name.match(/flat_gain_(\d+)_bin_(\d+)(?:_ir_(\d+))?/i))) {
@@ -487,8 +441,6 @@ function classifyCalibFile(path, rootDir) {
       gain = parseInt(m[1], 10); bin_ = parseInt(m[2], 10);
       isMaster = true;
    } else {
-      // Not a recognizable pre-built master filename - treat as a raw sub
-      // and read its own FITS header for authoritative values.
       try {
          let meta = readFrameMeta(path);
          camera = meta.camera || camera;
@@ -537,9 +489,6 @@ function findBestBias(lib, camera, gain, bin_) {
    return cands[0];
 }
 
-// Returns null (no candidates), {ambiguous:true, options:[...]} (multiple
-// IR-mode variants found with no way to know which matches the lights), or
-// {ambiguous:false, path:...} (exactly one variant - safe to use).
 function findBestFlat(lib, camera, gain, bin_) {
    let cands = lib.filter(function(r) { return r.kind == "flat" && r.camera == camera && r.gain == gain && r.bin == bin_ && r.isMaster; });
    if (cands.length == 0) return null;
@@ -551,14 +500,6 @@ function findBestFlat(lib, camera, gain, bin_) {
 
 // ---- Pipeline steps -------------------------------------------------------
 
-// ImageCalibration refuses to use a plain FITS file as a master calibration
-// frame unless it carries certain embedded metadata (it errors with "lacks
-// required capabilities for master calibration frames"). The pre-built
-// master files in a calibration library are often stripped-down FITS with
-// no keywords at all (their metadata lives only in the filename, which is
-// exactly what classifyCalibFile() already parsed out) - so re-embed the
-// values we already know and re-save as XISF before handing the path to
-// ImageCalibration.
 function materializeMasterFrame(rec, workDir, label) {
    let outDir = workDir + "/0_masters";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
@@ -579,16 +520,15 @@ function materializeMasterFrame(rec, workDir, label) {
    return outPath;
 }
 
-// Subtract matched master dark/bias/flat from each raw light frame (before
-// debayering - these calibrations are properties of the raw sensor, so they
-// have to be applied to the raw CFA data, not the debayered RGB image).
-// Any of masterDarkPath/masterBiasPath/masterFlatPath may be null/omitted;
-// only the ones actually found are applied.
 function runCalibration(files, workDir, masterDarkPath, masterBiasPath, masterFlatPath) {
    let outDir = workDir + "/0_calibrated";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
-   let existing = listFiles(outDir, "*_c.xisf");
-   if (existing.length == files.length) return existing; // already done from a previous run
+   let existing = listFiles(outDir, /_c\.xisf$/i);
+   if (existing.length == files.length) return existing;
+   clearDirFiles(outDir);
+   clearDirFiles(workDir + "/1_debayer");
+   clearDirFiles(workDir + "/2_aligned");
+
    let P = new ImageCalibration;
    P.targetFrames = files.map(function(p) { return [true, p]; });
    P.masterDarkEnabled = !!masterDarkPath;
@@ -601,28 +541,34 @@ function runCalibration(files, workDir, masterDarkPath, masterBiasPath, masterFl
    P.outputPostfix = "_c";
    P.overwriteExistingFiles = true;
    if (!P.executeGlobal()) throw new Error("ImageCalibration failed.");
-   return listFiles(outDir, "*_c.xisf");
+   return listFiles(outDir, /_c\.xisf$/i);
 }
 
 function runDebayer(files, workDir) {
    let outDir = workDir + "/1_debayer";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
-   let existing = listFiles(outDir, "*_d.xisf");
-   if (existing.length == files.length) return existing; // already done from a previous run
+   let existing = listFiles(outDir, /_d\.xisf$/i);
+   if (existing.length == files.length) return existing;
+   clearDirFiles(outDir);
+   clearDirFiles(workDir + "/2_aligned");
+
    let P = new Debayer;
+   P.cfaPattern = Debayer.prototype.Auto;
    P.targetItems = files.map(function(p) { return [true, p]; });
    P.outputDirectory = outDir;
    P.outputPostfix = "_d";
    P.overwriteExistingFiles = true;
    if (!P.executeGlobal()) throw new Error("Debayer failed.");
-   return listFiles(outDir, "*_d.xisf");
+   return listFiles(outDir, /_d\.xisf$/i);
 }
 
 function runStarAlignment(files, workDir) {
    let outDir = workDir + "/2_aligned";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
-   let existing = listFiles(outDir, "*_r.xisf");
-   if (existing.length == files.length) return existing; // already done from a previous run
+   let existing = listFiles(outDir, /_r\.xisf$/i);
+   if (existing.length == files.length) return existing;
+   clearDirFiles(outDir);
+
    let P = new StarAlignment;
    P.referenceImage = files[0];
    P.referenceIsFile = true;
@@ -632,44 +578,52 @@ function runStarAlignment(files, workDir) {
    P.overwriteExistingFiles = true;
    P.generateDrizzleData = false;
    if (!P.executeGlobal()) throw new Error("StarAlignment failed.");
-   return listFiles(outDir, "*_r.xisf");
+   return listFiles(outDir, /_r\.xisf$/i);
 }
 
-function runCometAlignment(files, workDir, x0, y0, x1, y1) {
-   let dates = files.map(function(p) {
-      let w = ImageWindow.open(p)[0];
-      let d = readDateObs(w);
-      w.forceClose();
-      return d;
+function sortFilesChronologically(files) {
+   let entries = files.map(function(p) {
+      let dateStr = readDateObsFromFile(p);
+      return { path: p, dateStr: dateStr, jd: toJD(dateStr) };
    });
-   let jds = dates.map(toJD);
-   let jd0 = jds[0], jd1 = jds[jds.length - 1];
+   entries.sort(function(a, b) { return a.jd - b.jd; });
+   return entries;
+}
+
+function runCometAlignment(entries, workDir, x0, y0, x1, y1) {
+   let jd0 = entries[0].jd;
+   let jd1 = entries[entries.length - 1].jd;
+   let dt = jd1 - jd0;
 
    // Workaround for CometAlignment's broken non-fixed interpolation:
    // compute every position ourselves and mark all frames "fixed".
    let targetFrames = [];
-   for (let i = 0; i < files.length; ++i) {
-      let t = (jds[i] - jd0) / (jd1 - jd0);
+   for (let i = 0; i < entries.length; ++i) {
+      let t = (dt > 0) ? (entries[i].jd - jd0) / dt : 0;
       let x = x0 + t * (x1 - x0), y = y0 + t * (y1 - y0);
-      targetFrames.push([files[i], true, dates[i], jds[i], x, y, true, ""]);
+      targetFrames.push([entries[i].path, true, entries[i].dateStr, entries[i].jd, x, y, true, ""]);
    }
 
    let outDir = workDir + "/3_comet_aligned";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
+   clearDirFiles(outDir);
+
    let P = new CometAlignment;
    P.targetFrames = targetFrames;
    P.referenceIndex = 0;
-   P.fitPSF = false; // positions are already exact; PSF-fit refinement is what triggers the NaN bug on noisy real data
+   P.fitPSF = false;
    P.outputDirectory = outDir;
    P.outputPostfix = "_ca";
    P.overwriteExistingFiles = true;
    if (!P.executeGlobal()) throw new Error("CometAlignment failed.");
-   return listFiles(outDir, "*_ca.xisf");
+   return listFiles(outDir, /_ca\.xisf$/i);
 }
 
 function runStarNet2Batch(files, workDir, nucleusX, nucleusY) {
    let outDir = workDir + "/4_starless";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
+   clearDirFiles(outDir);
+
    let warnings = [];
    for (let i = 0; i < files.length; ++i) {
       let w = ImageWindow.open(files[i])[0];
@@ -686,7 +640,7 @@ function runStarNet2Batch(files, workDir, nucleusX, nucleusY) {
       processEvents();
       gc();
    }
-   return { files: listFiles(outDir, "*_sn.xisf"), warnings: warnings };
+   return { files: listFiles(outDir, /_sn\.xisf$/i), warnings: warnings };
 }
 
 function runIntegration(files) {
@@ -695,7 +649,6 @@ function runIntegration(files) {
    P.inputHints = "";
    P.normalization = 0; // NoNormalization
    P.weightMode = 0;    // DontCare
-   // combination = Average, rejection = NoRejection (both defaults)
    P.generateRejectionMaps = false;
    P.evaluateSNR = false;
    if (!P.executeGlobal()) throw new Error("ImageIntegration failed.");
@@ -704,18 +657,50 @@ function runIntegration(files) {
    return w;
 }
 
-function combine(starWindow, cometWindow) {
-   starWindow.mainView.id = "starsLayer";
-   let P = new PixelMath;
-   P.expression = "max(starsLayer, cometStackLayer)";
-   P.useSingleExpression = true;
-   P.createNewImage = true;
-   P.newImageId = "CometStack_final";
-   P.showNewImage = true;
-   P.rescale = false;
-   P.truncate = true;
-   if (!P.executeOn(starWindow.mainView)) throw new Error("PixelMath combine failed.");
-   return ImageWindow.windowById("CometStack_final");
+// Isolates stars from the star-aligned reference frame by subtracting its
+// StarNet2 starless version, then screen-blends starsOnly over cometStackLayer
+// so single-frame background noise does not clip into the comet via max().
+function combine(refStarPath, cometWindow, workDir) {
+   let starWin = ImageWindow.open(refStarPath)[0];
+   let starlessWin = ImageWindow.open(refStarPath)[0];
+   try {
+      let sn = new StarNet2;
+      sn.mask = false;
+      sn.linear = true;
+      sn.executeOn(starlessWin.mainView);
+
+      starWin.mainView.id = "refStarsLayer";
+      starlessWin.mainView.id = "refStarlessLayer";
+
+      let subPM = new PixelMath;
+      subPM.expression = "max(0, refStarsLayer - refStarlessLayer)";
+      subPM.useSingleExpression = true;
+      subPM.createNewImage = true;
+      subPM.newImageId = "starsOnlyLayer";
+      subPM.showNewImage = false;
+      subPM.rescale = false;
+      subPM.truncate = true;
+      if (!subPM.executeOn(starWin.mainView)) throw new Error("PixelMath star isolation failed.");
+
+      let starsOnlyWin = ImageWindow.windowById("starsOnlyLayer");
+      try {
+         let blendPM = new PixelMath;
+         blendPM.expression = "1 - (1 - cometStackLayer) * (1 - starsOnlyLayer)";
+         blendPM.useSingleExpression = true;
+         blendPM.createNewImage = true;
+         blendPM.newImageId = "CometStack_final";
+         blendPM.showNewImage = true;
+         blendPM.rescale = false;
+         blendPM.truncate = true;
+         if (!blendPM.executeOn(cometWindow.mainView)) throw new Error("PixelMath screen blend failed.");
+         return ImageWindow.windowById("CometStack_final");
+      } finally {
+         if (starsOnlyWin) starsOnlyWin.forceClose();
+      }
+   } finally {
+      starlessWin.forceClose();
+      starWin.forceClose();
+   }
 }
 
 // ---- UI --------------------------------------------------------------------
@@ -727,31 +712,28 @@ function CometStackDialog() {
    let dlg = this;
    this.inputFiles = [];
    this.workDir = "";
-   this.alignedFiles = [];
+   this.orderedEntries = [];
    this.nucleusFirst = null;
    this.nucleusLast = null;
    this.calibLibrary = [];
 
    this.windowTitle = "OSC Comet Stacking";
    this.minWidth = 460;
-   this.position = new Point(100, 100); // safe on-screen starting position
+   this.position = new Point(100, 100);
 
    this.creditLabel = new Label(this);
    this.creditLabel.text = "by Petar Milevski (2026)";
    this.creditLabel.styleSheet = "font-style: italic; color: gray;";
    this.creditLabel.margin = 6;
 
-   // Step 0 (optional): point at a calibration library root - it's scanned
-   // recursively and matched against each light's own FITS header (camera,
-   // gain, binning, exposure time, sensor temperature) when step 1 runs.
-   // Anything that doesn't have a match (wrong gain, no dark at that temp,
-   // ambiguous flat variant, etc.) is simply left uncalibrated.
+   // Step 0 (optional): point at a calibration library root
    this.step0Button = new PushButton(this);
    this.step0Button.text = "(Optional) Select calibration frames folder...";
    this.step0Button.onClick = function() {
       let gdd = new GetDirectoryDialog;
       gdd.caption = "Select folder containing dark/flat/bias frames";
       if (!gdd.execute()) return;
+      dlg.step0Button.enabled = false;
       dlg.status0.text = "Scanning calibration library...";
       processEvents();
       try {
@@ -764,14 +746,15 @@ function CometStackDialog() {
       } catch (e) {
          dlg.status0.text = "ERROR scanning: " + e.message;
          dlg.calibLibrary = [];
+      } finally {
+         dlg.step0Button.enabled = true;
       }
    };
    this.status0 = new Label(this);
    this.status0.text = "No calibration folder selected (optional - lights used uncalibrated).";
    this.status0.wordWrapping = true;
 
-   // Step 1: pick folder, then immediately calibrate (if a matching dark/
-   // flat/bias was found) + Debayer + StarAlignment
+   // Step 1: pick folder, then calibrate (if matched) + Debayer + StarAlignment
    this.step1Button = new PushButton(this);
    this.step1Button.text = "1. Select light frames folder...";
    this.step1Button.onClick = function() {
@@ -779,10 +762,12 @@ function CometStackDialog() {
       gdd.caption = "Select folder containing light frames";
       if (!gdd.execute()) return;
 
-      dlg.inputFiles = listFiles(gdd.directory, "*.fits").concat(listFiles(gdd.directory, "*.fit")).concat(listFiles(gdd.directory, "*.xisf"));
+      dlg.step1Button.enabled = false;
+      dlg.inputFiles = listFiles(gdd.directory, /\.(fits|fit|xisf)$/i);
       dlg.workDir = gdd.directory + "/CometStack_work";
       if (dlg.inputFiles.length < 3) {
          dlg.status1.text = "Only " + dlg.inputFiles.length + " files found - need at least 3.";
+         dlg.step1Button.enabled = true;
          return;
       }
 
@@ -837,14 +822,17 @@ function CometStackDialog() {
          let debayered = runDebayer(filesToDebayer, dlg.workDir);
          dlg.status1.text = dlg.inputFiles.length + " files: running StarAlignment...";
          processEvents();
-         dlg.alignedFiles = runStarAlignment(debayered, dlg.workDir);
+         let aligned = runStarAlignment(debayered, dlg.workDir);
+         dlg.orderedEntries = sortFilesChronologically(aligned);
 
-         dlg.status1.text = dlg.alignedFiles.length + " frames aligned.";
+         dlg.status1.text = dlg.orderedEntries.length + " frames aligned and ordered by time.";
          setHighlight(dlg.step1Button, false);
          dlg.step2Button.enabled = true;
          setHighlight(dlg.step2Button, true);
       } catch (e) {
          dlg.status1.text = "ERROR: " + e.message;
+      } finally {
+         dlg.step1Button.enabled = true;
       }
    };
    this.status1 = new Label(this);
@@ -852,28 +840,34 @@ function CometStackDialog() {
    this.status1.wordWrapping = true;
    setHighlight(this.step1Button, true);
 
-   // Step 2: mark the nucleus in the first frame, then immediately the last
-   // frame - one continuous action, two self-contained picker dialogs back
-   // to back.
+   // Step 2: mark the nucleus in the first frame, then the last frame
    this.step2Button = new PushButton(this);
    this.step2Button.text = "2. Mark nucleus (first, then last frame)...";
    this.step2Button.enabled = false;
    this.step2Button.onClick = function() {
+      dlg.step2Button.enabled = false;
       try {
-         let r1 = pickNucleus(dlg.alignedFiles[0], "Mark comet nucleus", "Frame 1 of 2 (FIRST frame in the sequence)");
+         let firstPath = dlg.orderedEntries[0].path;
+         let lastPath = dlg.orderedEntries[dlg.orderedEntries.length - 1].path;
+
+         let r1 = pickNucleus(firstPath, "Mark comet nucleus", "Frame 1 of 2 (FIRST frame in chronological sequence)");
          if (!r1) { dlg.status2.text = "Cancelled."; return; }
          dlg.nucleusFirst = r1;
          dlg.status2.text = "First-frame nucleus: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + "). Now the last frame...";
          processEvents();
 
-         let r2 = pickNucleus(dlg.alignedFiles[dlg.alignedFiles.length - 1], "Mark comet nucleus", "Frame 2 of 2 (LAST frame in the sequence)");
+         let r2 = pickNucleus(lastPath, "Mark comet nucleus", "Frame 2 of 2 (LAST frame in chronological sequence)");
          if (!r2) { dlg.status2.text = "Cancelled after marking the first frame - click this button again to redo both."; return; }
          dlg.nucleusLast = r2;
          dlg.status2.text = "First: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ")  Last: (" + r2[0].toFixed(1) + ", " + r2[1].toFixed(1) + ")";
          setHighlight(dlg.step2Button, false);
          dlg.step3Button.enabled = true;
          setHighlight(dlg.step3Button, true);
-      } catch (e) { dlg.status2.text = "ERROR: " + e.message; }
+      } catch (e) {
+         dlg.status2.text = "ERROR: " + e.message;
+      } finally {
+         dlg.step2Button.enabled = true;
+      }
    };
    this.status2 = new Label(this);
    this.status2.text = "";
@@ -884,11 +878,12 @@ function CometStackDialog() {
    this.step3Button.text = "3. Run Comet Stack";
    this.step3Button.enabled = false;
    this.step3Button.onClick = function() {
+      dlg.step3Button.enabled = false;
       try {
          setHighlight(dlg.step3Button, false);
          dlg.status3.text = "Running CometAlignment...";
          processEvents();
-         let caFiles = runCometAlignment(dlg.alignedFiles, dlg.workDir,
+         let caFiles = runCometAlignment(dlg.orderedEntries, dlg.workDir,
             dlg.nucleusFirst[0], dlg.nucleusFirst[1], dlg.nucleusLast[0], dlg.nucleusLast[1]);
 
          dlg.status3.text = "Removing stars (StarNet2) from " + caFiles.length + " frames...";
@@ -901,8 +896,9 @@ function CometStackDialog() {
          processEvents();
          let cometWin = runIntegration(sn.files);
 
-         let starWin = ImageWindow.open(dlg.alignedFiles[0])[0];
-         let finalWin = combine(starWin, cometWin);
+         dlg.status3.text += "\nIsolating stars and combining layers...";
+         processEvents();
+         let finalWin = combine(dlg.orderedEntries[0].path, cometWin, dlg.workDir);
          applyAutoSTF(finalWin.mainView, 2.8, 0.25);
          finalWin.zoomToFit();
          finalWin.show();
@@ -915,6 +911,9 @@ function CometStackDialog() {
          setHighlight(dlg.closeButton, true);
       } catch (e) {
          dlg.status3.text = "ERROR: " + e.message;
+         setHighlight(dlg.step3Button, true);
+      } finally {
+         dlg.step3Button.enabled = true;
       }
    };
    this.status3 = new Label(this);
