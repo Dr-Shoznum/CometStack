@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="mainTail" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#e0f7fa" stop-opacity="0.95" />
+      <stop offset="55%" stop-color="#90caf9" stop-opacity="0.55" />
+      <stop offset="100%" stop-color="#64b5f6" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="ionTail" x1="100%" y1="0%" x2="15%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.85" />
+      <stop offset="100%" stop-color="#b3e5fc" stop-opacity="0" />
+    </linearGradient>
+    <radialGradient id="comaGlow" cx="45%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="1" />
+      <stop offset="50%" stop-color="#b2ebf2" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#4dd0e1" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  
+  <polygon points="44,12 6,42 20,56 50,22" fill="url(#mainTail)" />
+
+  
+  <line x1="46" y1="18" x2="14" y2="54" stroke="url(#ionTail)" stroke-width="2.5" stroke-linecap="round" />
+
+  
+  <circle cx="46" cy="18" r="11" fill="url(#comaGlow)" />
+
+  
+  <circle cx="46" cy="18" r="4.2" fill="#ffffff" stroke="#b0bec5" stroke-width="1" />
+
+  
+  <circle cx="16" cy="15" r="1.5" fill="#eceff1" opacity="0.85" />
+  <circle cx="52" cy="46" r="1.8" fill="#eceff1" opacity="0.8" />
+  <circle cx="33" cy="51" r="1.2" fill="#cfd8dc" opacity="0.7" />
+</svg>
