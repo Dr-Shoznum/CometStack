@@ -1210,7 +1210,7 @@ function runIntegration(files, mode) {
    P.weightMode = ImageIntegration.prototype.DontCare;
    if (useAverage && files.length >= 4) {
       P.rejection = ImageIntegration.prototype.WinsorizedSigmaClip;
-      P.rejectionNormalization = ImageIntegration.prototype.ScaleZeroOffset;
+      P.rejectionNormalization = 1; // 0 = None, 1 = Scale + Zero Offset
       P.sigmaLow = 4.0;
       P.sigmaHigh = 1.1;
    } else {
