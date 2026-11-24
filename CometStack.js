@@ -269,7 +269,7 @@ function showInfoDialog(parent) {
    titleLbl.text = "OSC Comet Stacking — Setup & Process Rundown";
    titleLbl.styleSheet = "font-size: 12pt; font-weight: bold;";
 
-   let readmeText =
+let readmeText =
       "by Petar Milevski (2026)  •  Automated post-nucleus stack & screen blend\n" +
       "============================================================\n\n" +
       "WHAT YOU NEED IN PIXINSIGHT\n" +
@@ -315,8 +315,9 @@ function showInfoDialog(parent) {
       "   warnings, and calls processEvents() + gc() between frames to\n" +
       "   prevent memory/stability crashes.\n" +
       "6. Starless Comet Integration: Integrates the starless comet frames\n" +
-      "   into 'cometStackLayer' so the comet and tail stack cleanly without\n" +
-      "   star trails.\n" +
+      "   into 'cometStackLayer' using median combination by default (or\n" +
+      "   average with tight high-sigma clipping for 4–12 frame stacks)\n" +
+      "   so the comet and tail stack cleanly without star-removal trails.\n" +
       "7. Star Isolation & Screen Blend: Runs StarNet2 on a copy of the\n" +
       "   star-aligned reference frame, isolates stars via:\n" +
       "      max(0, refStarsLayer - refStarlessLayer)\n" +
@@ -1195,19 +1196,26 @@ function runStarNet2Batch(files, workDir, nucleusX, nucleusY, logFn, statusFn, c
    return { files: listFiles(outDir, /_sn\.xisf$/i), warnings: warnings };
 }
 
-function runIntegration(files) {
+function runIntegration(files, mode) {
+   let chosenMode = mode || "median"; // Default: Median; supports "average" for small stacks (4-12 frames)
+   let useAverage = (chosenMode === "average");
+
    let P = new ImageIntegration;
    P.images = files.map(function(p) { return [true, p, "", ""]; });
    P.inputHints = "";
-   P.combination = ImageIntegration.prototype.Average;
-   P.normalization = ImageIntegration.prototype.NoNormalization;
+   P.combination = useAverage
+      ? ImageIntegration.prototype.Average
+      : ImageIntegration.prototype.Median;
+   P.normalization = ImageIntegration.prototype.AdditiveWithScaling;
    P.weightMode = ImageIntegration.prototype.DontCare;
-   P.rejection = (files.length >= 4)
-      ? ImageIntegration.prototype.WinsorizedSigmaClip
-      : ImageIntegration.prototype.NoRejection;
-   P.rejectionNormalization = ImageIntegration.prototype.NoRejectionNormalization;
-   P.sigmaLow = 4.0;
-   P.sigmaHigh = 3.0;
+   if (useAverage && files.length >= 4) {
+      P.rejection = ImageIntegration.prototype.WinsorizedSigmaClip;
+      P.rejectionNormalization = ImageIntegration.prototype.ScaleZeroOffset;
+      P.sigmaLow = 4.0;
+      P.sigmaHigh = 1.1;
+   } else {
+      P.rejection = ImageIntegration.prototype.NoRejection;
+   }
    P.generateRejectionMaps = false;
    P.evaluateSNR = false;
    if (!P.executeGlobal()) throw new Error("ImageIntegration failed.");
@@ -1381,6 +1389,7 @@ function CometStackDialog() {
       dlg.anchorCoordsByIdx = {};
       setHighlight(dlg.closeButton, false);
       dlg.setControlsBusy(true);
+      setHighlight(dlg.step1Button, false);
       dlg.inputFiles = listFiles(gdd.directory, /\.(fits|fit|xisf)$/i);
       dlg.workDir = gdd.directory + "/CometStack_work";
       if (dlg.inputFiles.length < 3) {
@@ -1475,6 +1484,7 @@ function CometStackDialog() {
          }
       } finally {
          dlg.setControlsBusy(false);
+         setHighlight(dlg.step1Button, false);
          if (!dlg.isCompleted && dlg.orderedEntries.length >= 3) {
             setHighlight(dlg.step2Button, true);
          }
@@ -1568,15 +1578,16 @@ function CometStackDialog() {
          }, dlg.checkCancelled);
 
          dlg.checkCancelled();
-         dlg.status2.text = "Integrating starless comet frames...";
-         dlg.log("Running ImageIntegration on starless frames...");
-         let cometWin = runIntegration(sn.files);
+         let integMode = (sn.files.length >= 4 && sn.files.length <= 12) ? "average" : "median";
+         dlg.status2.text = "Integrating starless comet frames (" + integMode + ")...";
+         dlg.log("Running ImageIntegration (" + integMode.toUpperCase() + ") on " + sn.files.length + " starless frames...");
+         let cometWin = runIntegration(sn.files, integMode);
 
          dlg.checkCancelled();
          dlg.status2.text = "Isolating stars and screen-blending...";
          dlg.log("Isolating reference stars and blending over comet stack...");
          let finalWin = combine(dlg.orderedEntries[0].path, cometWin, dlg.workDir);
-         applyAutoSTF(finalWin.mainView, 2.8, 0.25);
+         applyAutoSTF(finalWin.mainView, 2.8, 0.16);
          finalWin.zoomToFit();
          finalWin.show();
          finalWin.bringToFront();
