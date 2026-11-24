@@ -1,5 +1,5 @@
 #feature-id CometStack > CometStack
-
+#feature-icon CometStack.svg
 #include <pjsr/DataType.jsh>
 #include <pjsr/SampleType.jsh>
 #include <pjsr/StdButton.jsh>
@@ -12,21 +12,23 @@
 /*
  * CometStack - one-shot comet stacking for OSC (color) cameras.
  *
- * Workflow: Debayer -> StarAlignment -> mark nucleus in first/last frame
- * (via a self-contained click-to-zoom-then-drag picker, entirely inside this
- * dialog - no need to interact with separate PixInsight image windows) ->
- * CometAlignment -> StarNet2 -> ImageIntegration -> stars-only isolation and
- * screen blend with the comet stack.
+ * Tested on DWARF mini as well as Askar 200mm f/4 + ZWO ASI2600MC Duo.
+ *
+ * Workflow: Debayer -> StarAlignment -> sort by DATE-OBS -> detect time gaps
+ * and sudden reframes/shifts -> mark nucleus on anchor frames (first, last,
+ * and across gaps or big shifts) -> piecewise JD interpolation + local
+ * centroid refinement -> CometAlignment -> StarNet2 -> ImageIntegration ->
+ * stars-only isolation and screen blend with the comet stack.
  *
  * Real bugs found and worked around while building this against actual
  * DWARF mini + real comet data:
  *
  * 1. CometAlignment's own linear interpolation for non-fixed frames produces
  *    NaN positions (verified: reproducible even on clean synthetic data with
- *    as few as 3 frames). Workaround: compute the linear interpolation
- *    ourselves from Julian Dates and pass every frame as "fixed" with an
- *    explicit position, so CometAlignment's broken interpolation path is
- *    never used.
+ *    as few as 3 frames). Workaround: compute piecewise interpolation by
+ *    Julian Date (with local centroid refinement) and pass every frame as
+ *    "fixed" with an explicit position, so CometAlignment's broken
+ *    interpolation path is never used.
  * 2. Batch-processing many images through StarNet2 in a tight open/close
  *    loop can segfault the whole application. Workaround: call
  *    processEvents() and gc() between iterations.
@@ -36,6 +38,12 @@
  *    in this dialog: click roughly on the overview, then drag a small
  *    precise box on a magnified crop - no other window ever needs focus.
  */
+
+var GAP_MINUTES = 45;
+var SHIFT_JUMP_THRESHOLD = 80; // pixels between consecutive star-aligned frames
+var EXTREME_SHIFT_THRESHOLD = 250; // pixels threshold for logging a large-shift warning
+var LOCAL_SEARCH_RADIUS = 35;
+var DONATE_URL = "https://paypal.me/dpmilevski";
 
 // ---- UI & error helpers ----------------------------------------------------
 
@@ -56,6 +64,187 @@ function setHighlight(button, on) {
       ? "QPushButton { background-color: #2e7d32; color: #ffffff; font-weight: bold; padding: 6px 10px; border-radius: 3px; }"
       : "QPushButton { padding: 6px 10px; }";
 }
+
+function setStopHighlight(button, enabled) {
+   button.styleSheet = enabled
+      ? "QPushButton { background-color: #c62828; color: #ffffff; font-weight: bold; padding: 6px 10px; border-radius: 3px; }"
+      : "QPushButton { padding: 6px 10px; }";
+}
+
+function setDonateStyle(button) {
+   button.styleSheet = "QPushButton { background-color: #0070ba; color: #ffffff; font-weight: bold; padding: 6px 10px; border-radius: 3px; }";
+}
+
+function openPayPalOnUbuntu(url, logFn) {
+   if (typeof ExternalProcess !== "function") {
+      if (logFn) logFn("ExternalProcess is not available in this PixInsight runtime.");
+      return false;
+   }
+
+   let attempts = [
+      ["/usr/bin/firefox", [url]],
+      ["firefox", [url]],
+      ["/usr/bin/xdg-open", [url]],
+      ["xdg-open", [url]]
+   ];
+
+   for (let i = 0; i < attempts.length; ++i) {
+      let prog = attempts[i][0];
+      let args = attempts[i][1];
+      try {
+         let proc = new ExternalProcess;
+         proc.start(prog, args);
+         if (typeof proc.waitForStarted === "function") {
+            if (proc.waitForStarted(3000)) {
+               if (logFn) logFn("Started " + prog + " for " + url);
+               return true;
+            }
+            if (logFn) logFn("Timed out waiting for " + prog + " to start.");
+         } else {
+            if (logFn) logFn("Invoked " + prog + " for " + url);
+            return true;
+         }
+      } catch (e) {
+         if (logFn) logFn("Failed via " + prog + ": " + e.message);
+      }
+   }
+   return false;
+}
+
+function copyTextToClipboard(text, logFn) {
+   try {
+      if (typeof Clipboard !== "undefined") {
+         if (typeof Clipboard.setText === "function") {
+            Clipboard.setText(text);
+            if (logFn) logFn("Copied link to clipboard: " + text);
+            return true;
+         }
+         if ("text" in Clipboard) {
+            Clipboard.text = text;
+            if (logFn) logFn("Copied link to clipboard: " + text);
+            return true;
+         }
+         let cb = new Clipboard;
+         if (typeof cb.setText === "function") {
+            cb.setText(text);
+            if (logFn) logFn("Copied link to clipboard: " + text);
+            return true;
+         }
+         if ("text" in cb) {
+            cb.text = text;
+            if (logFn) logFn("Copied link to clipboard: " + text);
+            return true;
+         }
+      }
+   } catch (e) {
+      if (logFn) logFn("Clipboard copy note: " + e.message);
+   }
+   return false;
+}
+
+function showDonateFallbackDialog(url, parentDlg, logFn) {
+   let copied = copyTextToClipboard(url, logFn);
+
+   let dlg = new Dialog(parentDlg);
+   dlg.windowTitle = "Donate to CometStack";
+   dlg.minWidth = 420;
+
+   let titleLbl = new Label(dlg);
+   titleLbl.text = "Support CometStack Development";
+   titleLbl.styleSheet = "font-size: 12pt; font-weight: bold;";
+
+   let descLbl = new Label(dlg);
+   descLbl.text = "Could not open Firefox automatically. Use the link below to open PayPal:";
+   descLbl.wordWrapping = true;
+
+   let linkBox = new Edit(dlg);
+   linkBox.text = url;
+   linkBox.readOnly = true;
+   linkBox.styleSheet = "font-family: monospace; font-size: 10pt; padding: 4px;";
+
+   let statusLbl = new Label(dlg);
+   statusLbl.text = copied
+      ? "Link copied to clipboard — paste into Firefox or your PayPal app."
+      : "Select the link above and press Ctrl+C to copy.";
+   statusLbl.styleSheet = copied ? "color: #2e7d32; font-weight: bold;" : "color: #666666;";
+
+   let copyBtn = new PushButton(dlg);
+   copyBtn.text = "Copy Link";
+   copyBtn.onClick = function() {
+      let ok = copyTextToClipboard(url, logFn);
+      statusLbl.text = ok
+         ? "Link copied to clipboard — paste into Firefox or your PayPal app."
+         : "Please select the link above and copy manually (Ctrl+C).";
+      statusLbl.styleSheet = ok ? "color: #2e7d32; font-weight: bold;" : "color: #666666;";
+   };
+
+   let closeBtn = new PushButton(dlg);
+   closeBtn.text = "Close";
+   closeBtn.onClick = function() {
+      dlg.ok();
+   };
+
+   let btnSizer = new HorizontalSizer;
+   btnSizer.spacing = 8;
+   btnSizer.add(copyBtn);
+   btnSizer.addStretch();
+   btnSizer.add(closeBtn);
+
+   dlg.sizer = new VerticalSizer;
+   dlg.sizer.margin = 12;
+   dlg.sizer.spacing = 8;
+   dlg.sizer.add(titleLbl);
+   dlg.sizer.add(descLbl);
+   dlg.sizer.add(linkBox);
+   dlg.sizer.add(statusLbl);
+   dlg.sizer.add(btnSizer);
+   dlg.adjustToContents();
+   dlg.execute();
+}
+
+function openExternalUrl(url, parentDlg, logFn) {
+   if (openPayPalOnUbuntu(url, logFn)) {
+      return true;
+   }
+   showDonateFallbackDialog(url, parentDlg, logFn);
+   return false;
+}
+
+function createCometIconBitmap(size) {
+   let dim = size || 22;
+   let bmp = new Bitmap(dim, dim);
+   let g = new Graphics(bmp);
+
+   g.fillRect(0, 0, dim, dim, new Brush(0x00000000));
+
+   let headX = dim * 0.68;
+   let headY = dim * 0.32;
+
+   g.pen = new Pen(0x9090a4ae, Math.max(1, dim * 0.06));
+   g.drawLine(headX, headY, dim * 0.32, dim * 0.86);
+
+   g.pen = new Pen(0xe0cfd8dc, Math.max(1.5, dim * 0.11));
+   g.drawLine(headX, headY, dim * 0.15, dim * 0.82);
+
+   g.pen = new Pen(0xffffffff, 1);
+   g.brush = new Brush(0xb3e0f7fa);
+   g.drawCircle(headX, headY, dim * 0.17);
+
+   g.pen = new Pen(0xffffffff, 1);
+   g.brush = new Brush(0xffffffff);
+   g.drawCircle(headX, headY, dim * 0.08);
+
+   g.end();
+   return bmp;
+}
+
+function UserStoppedError(msg) {
+   this.name = "UserStoppedError";
+   this.message = msg || "Process stopped by user.";
+   this.stack = (new Error()).stack;
+}
+UserStoppedError.prototype = Object.create(Error.prototype);
+UserStoppedError.prototype.constructor = UserStoppedError;
 
 function showErrorDialog(title, err, logFn) {
    let msg = (err && err.message) ? err.message : String(err);
@@ -81,6 +270,8 @@ function showInfoDialog(parent) {
    titleLbl.styleSheet = "font-size: 12pt; font-weight: bold;";
 
    let readmeText =
+      "by Petar Milevski (2026)  •  Automated post-nucleus stack & screen blend\n" +
+      "============================================================\n\n" +
       "WHAT YOU NEED IN PIXINSIGHT\n" +
       "------------------------------------------------------------\n" +
       "• StarNet2 module installed and configured in PixInsight (required\n" +
@@ -102,18 +293,23 @@ function showInfoDialog(parent) {
       "------------------------------------------------------------\n" +
       "1. Calibration (Optional): Matches dark, flat, and bias frames to your\n" +
       "   light metadata and runs ImageCalibration into 0_calibrated/.\n" +
-      "2. Debayer & StarAlignment: Converts OSC frames to color (_d.xisf)\n" +
-      "   and aligns stars to the first frame (_r.xisf), then sorts frames\n" +
-      "   chronologically by Julian Date derived from DATE-OBS.\n" +
-      "3. Nucleus Marking (First & Last Frame): Opens an embedded picker\n" +
-      "   with AutomaticBackgroundExtractor + screen stretch so you can click\n" +
-      "   roughly on the nucleus, zoom in, and drag a box around it on the\n" +
-      "   first and last frames. A brightness-weighted centroid refines each\n" +
-      "   position, and stacking begins automatically after frame 2.\n" +
-      "4. CometAlignment (Custom JD Interpolation): Computes linear nucleus\n" +
-      "   positions across frames by Julian Date and passes every frame as\n" +
-      "   'fixed' to CometAlignment (_ca.xisf), avoiding PixInsight's broken\n" +
-      "   built-in non-fixed interpolation.\n" +
+      "2. Debayer, StarAlignment & Jump Detection: Converts OSC frames to\n" +
+      "   color (_d.xisf), aligns stars to the first frame (_r.xisf), sorts\n" +
+      "   frames chronologically by Julian Date (DATE-OBS), flags time\n" +
+      "   gaps (> " + GAP_MINUTES + " min) or frame-to-frame shifts (> " + SHIFT_JUMP_THRESHOLD + " px), and\n" +
+      "   logs warnings listing images with large shifts (> " + EXTREME_SHIFT_THRESHOLD + " px)\n" +
+      "   without automatically rejecting them.\n" +
+      "3. Anchor Nucleus Marking: Opens the embedded zoom + box picker\n" +
+      "   (with AutomaticBackgroundExtractor + screen stretch) on the first\n" +
+      "   frame, last frame, and frames bordering any detected time gap or\n" +
+      "   large shift, refining each pick with a brightness-weighted centroid.\n" +
+      "4. Piecewise Interpolation & Local Refinement: Interpolates nucleus\n" +
+      "   positions linearly by Julian Date between anchors, refines each\n" +
+      "   intermediate frame within a ±" + LOCAL_SEARCH_RADIUS + " px local search box using a\n" +
+      "   background-subtracted centroid (falling back to the interpolated\n" +
+      "   position if signal is weak), and passes every frame as 'fixed' to\n" +
+      "   CometAlignment (_ca.xisf) to avoid PixInsight's broken built-in\n" +
+      "   non-fixed interpolation.\n" +
       "5. Batch StarNet2 Removal: Runs StarNet2 on each comet-aligned frame\n" +
       "   (_sn.xisf), monitors nucleus peak brightness for over-removal\n" +
       "   warnings, and calls processEvents() + gc() between frames to\n" +
@@ -246,6 +442,104 @@ function weightedCentroidNative(image, rect) {
    }
    if (sumW <= 0) return [(rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2];
    return [sumX / sumW, sumY / sumW];
+}
+
+// Measures the active (non-zero) bounding box of a star-aligned frame so
+// sudden reframes or large alignment shifts can be detected between frames.
+function measureActiveBounds(filePath) {
+   let w = ImageWindow.open(filePath)[0];
+   try {
+      let img = w.mainView.image;
+      let step = Math.max(1, Math.floor(Math.min(img.width, img.height) / 300));
+      let minX = img.width, maxX = -1, minY = img.height, maxY = -1;
+      let rowBuf = new Float32Array(img.width);
+
+      for (let y = 0; y < img.height; y += step) {
+         img.getSamples(rowBuf, new Rect(0, y, img.width, y + 1), 0);
+         for (let x = 0; x < img.width; x += step) {
+            if (rowBuf[x] > 0) {
+               if (x < minX) minX = x;
+               if (x > maxX) maxX = x;
+               if (y < minY) minY = y;
+               if (y > maxY) maxY = y;
+            }
+         }
+      }
+
+      if (maxX < minX || maxY < minY) {
+         return { cx: img.width / 2, cy: img.height / 2, w: img.width, h: img.height };
+      }
+      return {
+         cx: (minX + maxX) / 2,
+         cy: (minY + maxY) / 2,
+         w: maxX - minX,
+         h: maxY - minY
+      };
+   } finally {
+      w.forceClose();
+   }
+}
+
+// Local centroid refinement around an interpolated prediction (predX, predY).
+// Subtracts local median so coma/background gradients don't bias the center,
+// and falls back to the prediction if signal is weak or drift is extreme.
+function refineNucleusLocally(filePath, predX, predY, radius) {
+   let w = ImageWindow.open(filePath)[0];
+   try {
+      let img = w.mainView.image;
+      let r = radius || LOCAL_SEARCH_RADIUS;
+      let x0 = Math.max(0, Math.min(img.width - 2, Math.floor(predX - r)));
+      let y0 = Math.max(0, Math.min(img.height - 2, Math.floor(predY - r)));
+      let x1 = Math.max(x0 + 2, Math.min(img.width, Math.ceil(predX + r)));
+      let y1 = Math.max(y0 + 2, Math.min(img.height, Math.ceil(predY + r)));
+      let rect = new Rect(x0, y0, x1, y1);
+      let ww = rect.x1 - rect.x0, hh = rect.y1 - rect.y0;
+      let n = img.numberOfChannels;
+
+      let acc = new Float64Array(ww * hh);
+      let buf = new Float64Array(ww * hh);
+      for (let ch = 0; ch < n; ++ch) {
+         img.getSamples(buf, rect, ch);
+         for (let i = 0; i < buf.length; ++i) acc[i] += buf[i];
+      }
+
+      let sorted = Array.prototype.slice.call(acc).sort(function(a, b) { return a - b; });
+      let bkg = sorted[Math.floor(sorted.length * 0.5)] || 0;
+      let peak = sorted[sorted.length - 1] || 0;
+      let q90 = sorted[Math.floor(sorted.length * 0.9)] || bkg;
+      let q10 = sorted[Math.floor(sorted.length * 0.1)] || bkg;
+      let spread = Math.max(1e-9, q90 - q10);
+
+      // Require a clear local peak above background so we don't lock onto pure noise.
+      if ((peak - bkg) < 2.5 * spread) {
+         return { pos: [predX, predY], refined: false };
+      }
+
+      let sumW = 0, sumX = 0, sumY = 0;
+      for (let yy = 0; yy < hh; ++yy) {
+         for (let xx = 0; xx < ww; ++xx) {
+            let excess = acc[yy * ww + xx] - bkg;
+            if (excess > 0) {
+               let weight = excess * excess;
+               sumW += weight;
+               sumX += weight * (rect.x0 + xx);
+               sumY += weight * (rect.y0 + yy);
+            }
+         }
+      }
+
+      if (sumW <= 0) return { pos: [predX, predY], refined: false };
+      let cx = sumX / sumW, cy = sumY / sumW;
+      let dx = cx - predX, dy = cy - predY;
+      let dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > r * 0.75) {
+         return { pos: [predX, predY], refined: false };
+      }
+
+      return { pos: [cx, cy], refined: true };
+   } finally {
+      w.forceClose();
+   }
 }
 
 // PixInsight's standard screen-stretch algorithm, so previews look natural.
@@ -702,17 +996,124 @@ function sortFilesChronologically(files) {
    return entries;
 }
 
-function runCometAlignment(entries, workDir, x0, y0, x1, y1) {
-   let jd0 = entries[0].jd;
-   let jd1 = entries[entries.length - 1].jd;
-   let dt = jd1 - jd0;
+// Identifies anchor frame indices: always first and last, plus frames
+// immediately before/after a time gap or a sudden shift/reframe jump.
+// Warns and lists images with large shifts without rejecting them.
+function findAnchorIndices(entries, gapMinutes, shiftThreshold, extremeShiftThreshold, logFn, checkStopFn) {
+   let gapDays = (gapMinutes || GAP_MINUTES) / 1440;
+   let maxShift = shiftThreshold || SHIFT_JUMP_THRESHOLD;
+   let extremeShift = extremeShiftThreshold || EXTREME_SHIFT_THRESHOLD;
+   let set = {};
+   set[0] = true;
+   set[entries.length - 1] = true;
 
+   let bounds = entries.map(function(e, idx) {
+      processEvents();
+      if (checkStopFn) checkStopFn();
+      return measureActiveBounds(e.path);
+   });
+
+   let gapCount = 0;
+   let shiftCount = 0;
+   let extremeItems = [];
+
+   for (let i = 1; i < entries.length; ++i) {
+      let dtDays = entries[i].jd - entries[i - 1].jd;
+      let isTimeGap = dtDays > gapDays;
+
+      let dx = bounds[i].cx - bounds[i - 1].cx;
+      let dy = bounds[i].cy - bounds[i - 1].cy;
+      let dw = bounds[i].w - bounds[i - 1].w;
+      let dh = bounds[i].h - bounds[i - 1].h;
+      let shiftMag = Math.sqrt(dx * dx + dy * dy + 0.25 * (dw * dw + dh * dh));
+      let isShiftJump = shiftMag > maxShift;
+
+      if (isTimeGap || isShiftJump) {
+         set[i - 1] = true;
+         set[i] = true;
+         if (isTimeGap) ++gapCount;
+         if (isShiftJump) ++shiftCount;
+         if (logFn) {
+            let reasons = [];
+            if (isTimeGap) reasons.push((dtDays * 1440).toFixed(1) + "m gap");
+            if (isShiftJump) reasons.push(shiftMag.toFixed(0) + "px shift");
+            logFn("   Detected discontinuity between frame #" + i + " and #" + (i + 1) + " (" + reasons.join(", ") + ").");
+         }
+      }
+
+      if (shiftMag > extremeShift) {
+         extremeItems.push({
+            idxA: i - 1,
+            idxB: i,
+            nameA: File.extractName(entries[i - 1].path),
+            nameB: File.extractName(entries[i].path),
+            shift: shiftMag
+         });
+      }
+   }
+
+   if (logFn) {
+      if (gapCount > 0 || shiftCount > 0) {
+         logFn("   Anchor triggers: " + gapCount + " time gap(s), " + shiftCount + " shift/reframe jump(s).");
+      }
+      if (extremeItems.length > 0) {
+         let listStr = extremeItems.map(function(it) {
+            return "#" + (it.idxA + 1) + " (" + it.nameA + ") -> #" + (it.idxB + 1) + " (" + it.nameB + ") [" + it.shift.toFixed(0) + "px]";
+         }).join("; ");
+         logFn("   WARNING: Large shift (> " + extremeShift + "px) detected — kept in stack, check: " + listStr);
+      }
+   }
+
+   return Object.keys(set).map(function(k) { return parseInt(k, 10); }).sort(function(a, b) { return a - b; });
+}
+
+// Computes nucleus coordinates for all frames using piecewise JD interpolation
+// between manual anchor picks, refined locally around each predicted position.
+function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
+   let anchorIndices = Object.keys(anchorCoordsByIdx)
+      .map(function(k) { return parseInt(k, 10); })
+      .sort(function(a, b) { return a - b; });
+
+   let positions = new Array(entries.length);
+   for (let a = 0; a < anchorIndices.length; ++a) {
+      let idx = anchorIndices[a];
+      positions[idx] = anchorCoordsByIdx[idx];
+   }
+
+   let refinedCount = 0;
+   for (let a = 0; a < anchorIndices.length - 1; ++a) {
+      let i0 = anchorIndices[a];
+      let i1 = anchorIndices[a + 1];
+      let jd0 = entries[i0].jd;
+      let jd1 = entries[i1].jd;
+      let dt = jd1 - jd0;
+      let p0 = positions[i0];
+      let p1 = positions[i1];
+
+      for (let k = i0 + 1; k < i1; ++k) {
+         processEvents();
+         if (checkStopFn) checkStopFn();
+         let t = (dt > 0) ? (entries[k].jd - jd0) / dt : 0;
+         let predX = p0[0] + t * (p1[0] - p0[0]);
+         let predY = p0[1] + t * (p1[1] - p0[1]);
+         let loc = refineNucleusLocally(entries[k].path, predX, predY, LOCAL_SEARCH_RADIUS);
+         positions[k] = loc.pos;
+         if (loc.refined) ++refinedCount;
+      }
+   }
+
+   if (logFn) {
+      logFn("   Refined " + refinedCount + " of " + Math.max(0, entries.length - anchorIndices.length) + " intermediate frame(s) via local centroid search.");
+   }
+   return positions;
+}
+
+function runCometAlignment(entries, positions, workDir) {
    // Workaround for CometAlignment's broken non-fixed interpolation:
    // compute every position ourselves and mark all frames "fixed".
    let targetFrames = [];
    for (let i = 0; i < entries.length; ++i) {
-      let t = (dt > 0) ? (entries[i].jd - jd0) / dt : 0;
-      let x = x0 + t * (x1 - x0), y = y0 + t * (y1 - y0);
+      let x = positions[i][0], y = positions[i][1];
       targetFrames.push([entries[i].path, true, entries[i].dateStr, entries[i].jd, x, y, true, ""]);
    }
 
@@ -731,7 +1132,7 @@ function runCometAlignment(entries, workDir, x0, y0, x1, y1) {
    return listFiles(outDir, /_ca\.xisf$/i);
 }
 
-function runStarNet2Batch(files, workDir, nucleusX, nucleusY, logFn) {
+function runStarNet2Batch(files, workDir, nucleusX, nucleusY, logFn, statusFn, checkStopFn) {
    let outDir = workDir + "/4_starless";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
    clearDirFiles(outDir);
@@ -741,12 +1142,14 @@ function runStarNet2Batch(files, workDir, nucleusX, nucleusY, logFn) {
    }
 
    let warnings = [];
-   let firstFrameSec = null;
+   let avgFrameSec = null;
 
    for (let i = 0; i < files.length; ++i) {
+      processEvents();
+      if (checkStopFn) checkStopFn();
+
       let tStart = Date.now();
       if (logFn) logFn("   StarNet2 [" + (i + 1) + "/" + files.length + "]: " + File.extractName(files[i]));
-      processEvents();
       let w = ImageWindow.open(files[i])[0];
       let before = peakInRegion(w.mainView, nucleusX, nucleusY, 40);
       let P = new StarNet2;
@@ -763,17 +1166,31 @@ function runStarNet2Batch(files, workDir, nucleusX, nucleusY, logFn) {
       w.forceClose();
 
       let elapsedSec = (Date.now() - tStart) / 1000;
-      if (i === 0) {
-         firstFrameSec = elapsedSec;
-         let remainingFrames = files.length - 1;
-         if (logFn && remainingFrames > 0) {
-            let estRemainingSec = firstFrameSec * remainingFrames;
-            logFn("   First frame took " + formatDuration(firstFrameSec) + ". Estimated time remaining for " + remainingFrames + " frame(s): ~" + formatDuration(estRemainingSec) + ".");
+      if (avgFrameSec === null) {
+         avgFrameSec = elapsedSec;
+      } else {
+         avgFrameSec = 0.7 * avgFrameSec + 0.3 * elapsedSec;
+      }
+
+      let remainingFrames = files.length - 1 - i;
+      if (remainingFrames > 0) {
+         let estRemainingSec = avgFrameSec * remainingFrames;
+         let etaStr = "~" + formatDuration(estRemainingSec);
+         if (statusFn) {
+            statusFn("StarNet2 [" + (i + 1) + "/" + files.length + "] — Estimated time remaining for " + remainingFrames + " frame(s): " + etaStr);
+         }
+         if (logFn) {
+            if (i === 0) {
+               logFn("   First frame took " + formatDuration(elapsedSec) + ". Estimated time remaining for " + remainingFrames + " frame(s): " + etaStr + ".");
+            } else {
+               logFn("   Frame took " + formatDuration(elapsedSec) + " (avg " + formatDuration(avgFrameSec) + "). Estimated time remaining for " + remainingFrames + " frame(s): " + etaStr + ".");
+            }
          }
       }
 
       processEvents();
       gc();
+      if (checkStopFn) checkStopFn();
    }
    return { files: listFiles(outDir, /_sn\.xisf$/i), warnings: warnings };
 }
@@ -782,8 +1199,15 @@ function runIntegration(files) {
    let P = new ImageIntegration;
    P.images = files.map(function(p) { return [true, p, "", ""]; });
    P.inputHints = "";
-   P.normalization = 0; // NoNormalization
-   P.weightMode = 0;    // DontCare
+   P.combination = ImageIntegration.prototype.Average;
+   P.normalization = ImageIntegration.prototype.NoNormalization;
+   P.weightMode = ImageIntegration.prototype.DontCare;
+   P.rejection = (files.length >= 4)
+      ? ImageIntegration.prototype.WinsorizedSigmaClip
+      : ImageIntegration.prototype.NoRejection;
+   P.rejectionNormalization = ImageIntegration.prototype.NoRejectionNormalization;
+   P.sigmaLow = 4.0;
+   P.sigmaHigh = 3.0;
    P.generateRejectionMaps = false;
    P.evaluateSNR = false;
    if (!P.executeGlobal()) throw new Error("ImageIntegration failed.");
@@ -853,14 +1277,16 @@ function CometStackDialog() {
    this.inputFiles = [];
    this.workDir = "";
    this.orderedEntries = [];
-   this.nucleusFirst = null;
-   this.nucleusLast = null;
+   this.anchorCoordsByIdx = {};
    this.calibLibrary = [];
    this.isRunning = false;
    this.isCompleted = false;
+   this.cancelRequested = false;
+
+   let cometIcon = createCometIconBitmap(22);
 
    this.windowTitle = "OSC Comet Stacking";
-   this.minWidth = 540;
+   this.minWidth = 560;
    this.position = new Point(100, 100);
 
    this.log = function(line) {
@@ -871,40 +1297,44 @@ function CometStackDialog() {
       processEvents();
    };
 
+   this.checkCancelled = function() {
+      processEvents();
+      if (dlg.cancelRequested) {
+         throw new UserStoppedError("Process stopped by user.");
+      }
+   };
+
    this.setControlsBusy = function(busy) {
       dlg.isRunning = busy;
+      if (busy) dlg.cancelRequested = false;
       dlg.step0Button.enabled = !busy;
       dlg.step1Button.enabled = !busy;
       dlg.step2Button.enabled = !busy && !dlg.isCompleted && dlg.orderedEntries.length >= 3;
+      dlg.stopButton.enabled = busy;
+      setStopHighlight(dlg.stopButton, busy);
       dlg.closeButton.enabled = !busy;
    };
 
-   // Header + Info button right next to heading title
+   // Centered Header
+   this.headerIcon = new Label(this);
+   this.headerIcon.pixmap = cometIcon;
+   this.headerIcon.setFixedSize(22, 22);
+
    this.headerLabel = new Label(this);
    this.headerLabel.text = "OSC Comet Stacking";
-   this.headerLabel.styleSheet = "font-size: 13pt; font-weight: bold;";
-
-   this.infoButton = new PushButton(this);
-   this.infoButton.text = "Info / Process";
-   this.infoButton.toolTip = "View PixInsight requirements (such as StarNet2) and a rundown of how stacking works";
-   this.infoButton.styleSheet = "QPushButton { padding: 3px 8px; font-size: 9pt; }";
-   this.infoButton.onClick = function() {
-      showInfoDialog(dlg);
-   };
+   this.headerLabel.styleSheet = "font-size: 13.5pt; font-weight: bold;";
 
    let headerSizer = new HorizontalSizer;
    headerSizer.spacing = 8;
-   headerSizer.add(this.headerLabel);
-   headerSizer.add(this.infoButton);
    headerSizer.addStretch();
-
-   this.creditLabel = new Label(this);
-   this.creditLabel.text = "by Petar Milevski (2026)  •  Automated post-nucleus stack & screen blend";
-   this.creditLabel.styleSheet = "font-style: italic; color: #777777;";
+   headerSizer.add(this.headerIcon);
+   headerSizer.add(this.headerLabel);
+   headerSizer.addStretch();
 
    // Group 1: Inputs & Preparation
    this.prepGroup = new GroupBox(this);
-   this.prepGroup.title = "1. Calibration & Light Frames";
+   this.prepGroup.title = "1. Calibration and Light Frames";
+   this.prepGroup.styleSheet = "QGroupBox { font-size: 10.5pt; font-weight: bold; }";
 
    this.step0Button = new PushButton(this.prepGroup);
    this.step0Button.text = "Select Calibration Folder (Optional)...";
@@ -937,7 +1367,7 @@ function CometStackDialog() {
    this.status0 = new Label(this.prepGroup);
    this.status0.text = "No calibration folder selected (lights will run uncalibrated).";
    this.status0.wordWrapping = true;
-   this.status0.styleSheet = "color: #666666;";
+   this.status0.styleSheet = "color: #666666; font-weight: normal; font-size: 9pt;";
 
    this.step1Button = new PushButton(this.prepGroup);
    this.step1Button.text = "Select Light Frames Folder...";
@@ -948,6 +1378,7 @@ function CometStackDialog() {
       if (!gdd.execute()) return;
 
       dlg.isCompleted = false;
+      dlg.anchorCoordsByIdx = {};
       setHighlight(dlg.closeButton, false);
       dlg.setControlsBusy(true);
       dlg.inputFiles = listFiles(gdd.directory, /\.(fits|fit|xisf)$/i);
@@ -962,6 +1393,7 @@ function CometStackDialog() {
 
       dlg.log("Found " + dlg.inputFiles.length + " light frames. Work folder: " + dlg.workDir);
       try {
+         dlg.checkCancelled();
          let filesToDebayer = dlg.inputFiles;
 
          if (dlg.calibLibrary.length > 0) {
@@ -997,6 +1429,7 @@ function CometStackDialog() {
 
             dlg.log("Calibration match: " + msgs.join(", "));
             if (darkPath || biasPath || flatPath) {
+               dlg.checkCancelled();
                dlg.status1.text = "Calibrating (" + msgs.join(", ") + ")...";
                dlg.log("Running ImageCalibration...");
                filesToDebayer = runCalibration(dlg.inputFiles, dlg.workDir, darkPath, biasPath, flatPath);
@@ -1005,18 +1438,27 @@ function CometStackDialog() {
             }
          }
 
+         dlg.checkCancelled();
          dlg.status1.text = "Running Debayer...";
          dlg.log("Running Debayer on " + filesToDebayer.length + " frames...");
          let debayered = runDebayer(filesToDebayer, dlg.workDir);
 
+         dlg.checkCancelled();
          dlg.status1.text = "Running StarAlignment...";
          dlg.log("Running StarAlignment on " + debayered.length + " debayered frames...");
          let aligned = runStarAlignment(debayered, dlg.workDir);
 
+         dlg.checkCancelled();
          dlg.log("Sorting aligned frames chronologically by DATE-OBS...");
          dlg.orderedEntries = sortFilesChronologically(aligned);
 
-         let doneMsg = dlg.orderedEntries.length + " frames aligned & ordered.";
+         dlg.checkCancelled();
+         dlg.status1.text = "Scanning for time gaps and reframes/shifts...";
+         dlg.log("Scanning aligned frames for time gaps (> " + GAP_MINUTES + "m) and shifts (> " + SHIFT_JUMP_THRESHOLD + "px)...");
+         let anchors = findAnchorIndices(dlg.orderedEntries, GAP_MINUTES, SHIFT_JUMP_THRESHOLD, EXTREME_SHIFT_THRESHOLD, dlg.log, dlg.checkCancelled);
+         let extraAnchors = Math.max(0, anchors.length - 2);
+         let doneMsg = dlg.orderedEntries.length + " frames aligned & ordered" +
+            (extraAnchors > 0 ? (" (" + extraAnchors + " extra anchor(s) from gaps/shifts)") : "") + ".";
          dlg.status1.text = doneMsg;
          dlg.log(doneMsg);
 
@@ -1024,8 +1466,13 @@ function CometStackDialog() {
          dlg.step2Button.enabled = true;
          setHighlight(dlg.step2Button, true);
       } catch (e) {
-         dlg.status1.text = "Preparation failed.";
-         showErrorDialog("Light Preparation", e, dlg.log);
+         if (e instanceof UserStoppedError) {
+            dlg.status1.text = "Preparation stopped by user.";
+            dlg.log("Preparation stopped by user.");
+         } else {
+            dlg.status1.text = "Preparation failed.";
+            showErrorDialog("Light Preparation", e, dlg.log);
+         }
       } finally {
          dlg.setControlsBusy(false);
          if (!dlg.isCompleted && dlg.orderedEntries.length >= 3) {
@@ -1037,6 +1484,7 @@ function CometStackDialog() {
    this.status1 = new Label(this.prepGroup);
    this.status1.text = "Waiting for light frames folder.";
    this.status1.wordWrapping = true;
+   this.status1.styleSheet = "font-weight: normal; font-size: 9pt;";
 
    this.prepGroup.sizer = new VerticalSizer;
    this.prepGroup.sizer.margin = 10;
@@ -1049,60 +1497,82 @@ function CometStackDialog() {
 
    // Group 2: Nucleus Marking -> Auto-Run Comet Stack
    this.cometGroup = new GroupBox(this);
-   this.cometGroup.title = "2. Comet Nucleus & Automatic Stacking";
+   this.cometGroup.title = "2. Comet Nucleus and Automatic Stacking";
+   this.cometGroup.styleSheet = "QGroupBox { font-size: 10.5pt; font-weight: bold; }";
 
    this.step2Button = new PushButton(this.cometGroup);
-   this.step2Button.text = "Mark Nucleus (First, then Last Frame) & Run";
+   this.step2Button.text = "Mark Nucleus on Anchors and Run";
+   this.step2Button.icon = cometIcon;
    this.step2Button.enabled = false;
    setHighlight(this.step2Button, false);
 
    this.status2 = new Label(this.cometGroup);
    this.status2.text = "Complete step 1 to enable nucleus selection.";
    this.status2.wordWrapping = true;
+   this.status2.styleSheet = "font-weight: normal; font-size: 9pt;";
 
    this.step2Button.onClick = function() {
       dlg.setControlsBusy(true);
       setHighlight(dlg.step2Button, false);
       try {
-         let firstPath = dlg.orderedEntries[0].path;
-         let lastPath = dlg.orderedEntries[dlg.orderedEntries.length - 1].path;
+         dlg.checkCancelled();
+         let anchorIndices = findAnchorIndices(dlg.orderedEntries, GAP_MINUTES, SHIFT_JUMP_THRESHOLD, EXTREME_SHIFT_THRESHOLD, null, dlg.checkCancelled);
+         let coordsByIdx = {};
 
-         dlg.log("Opening first frame for nucleus selection...");
-         let r1 = pickNucleus(firstPath, "Mark comet nucleus", "Frame 1 of 2 (FIRST frame in chronological sequence)");
-         if (!r1) {
-            dlg.status2.text = "Cancelled on first frame.";
-            dlg.log("Nucleus selection cancelled on first frame.");
-            return;
+         for (let a = 0; a < anchorIndices.length; ++a) {
+            dlg.checkCancelled();
+            let idx = anchorIndices[a];
+            let entry = dlg.orderedEntries[idx];
+            let role = (idx === 0)
+               ? "FIRST frame"
+               : (idx === dlg.orderedEntries.length - 1)
+                  ? "LAST frame"
+                  : "GAP/SHIFT boundary frame #" + (idx + 1);
+
+            dlg.status2.text = "Marking anchor " + (a + 1) + " of " + anchorIndices.length + " (" + role + ")...";
+            dlg.log("Opening " + role + " [index " + idx + ", " + entry.dateStr + "] for nucleus selection...");
+
+            let pt = pickNucleus(
+               entry.path,
+               "Mark comet nucleus (" + (a + 1) + "/" + anchorIndices.length + ")",
+               "Anchor " + (a + 1) + " of " + anchorIndices.length + " — " + role + " (" + entry.dateStr + ")"
+            );
+            if (!pt) {
+               dlg.status2.text = "Cancelled on anchor " + (a + 1) + " of " + anchorIndices.length + " — click button to restart.";
+               dlg.log("Nucleus selection cancelled on anchor " + (a + 1) + " of " + anchorIndices.length + ".");
+               return;
+            }
+            coordsByIdx[idx] = pt;
+            dlg.log("Anchor [" + idx + "] marked at (" + pt[0].toFixed(1) + ", " + pt[1].toFixed(1) + ").");
          }
-         dlg.nucleusFirst = r1;
-         dlg.status2.text = "First: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ") — select last frame...";
-         dlg.log("First nucleus marked at (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ").");
 
-         let r2 = pickNucleus(lastPath, "Mark comet nucleus", "Frame 2 of 2 (LAST frame in chronological sequence)");
-         if (!r2) {
-            dlg.status2.text = "Cancelled on last frame — click button again to redo both.";
-            dlg.log("Nucleus selection cancelled on second frame.");
-            return;
-         }
-         dlg.nucleusLast = r2;
-         dlg.status2.text = "First: (" + r1[0].toFixed(1) + ", " + r1[1].toFixed(1) + ")  |  Last: (" + r2[0].toFixed(1) + ", " + r2[1].toFixed(1) + ")";
-         dlg.log("Last nucleus marked at (" + r2[0].toFixed(1) + ", " + r2[1].toFixed(1) + "). Starting Comet Stack automatically...");
-         processEvents();
+         dlg.checkCancelled();
+         dlg.anchorCoordsByIdx = coordsByIdx;
+         dlg.status2.text = "Interpolating & locally refining " + dlg.orderedEntries.length + " frame positions...";
+         dlg.log("Computing piecewise JD trajectory with local centroid refinement...");
+         let positions = computeCometPositions(dlg.orderedEntries, coordsByIdx, dlg.log, dlg.checkCancelled);
 
+         dlg.checkCancelled();
          dlg.status2.text = "Running CometAlignment...";
-         dlg.log("Running CometAlignment...");
-         let caFiles = runCometAlignment(dlg.orderedEntries, dlg.workDir,
-            dlg.nucleusFirst[0], dlg.nucleusFirst[1], dlg.nucleusLast[0], dlg.nucleusLast[1]);
+         dlg.log("Running CometAlignment (" + dlg.orderedEntries.length + " fixed frames)...");
+         let caFiles = runCometAlignment(dlg.orderedEntries, positions, dlg.workDir);
          dlg.log("CometAlignment produced " + caFiles.length + " aligned frames.");
 
+         dlg.checkCancelled();
          dlg.status2.text = "Running StarNet2 on " + caFiles.length + " frames...";
          dlg.log("Removing stars with StarNet2...");
-         let sn = runStarNet2Batch(caFiles, dlg.workDir, dlg.nucleusFirst[0], dlg.nucleusFirst[1], dlg.log);
+         let refNucleus = coordsByIdx[0];
+         let sn = runStarNet2Batch(caFiles, dlg.workDir, refNucleus[0], refNucleus[1], dlg.log, function(msg) {
+            dlg.status2.text = msg;
+            processEvents();
+         }, dlg.checkCancelled);
 
+         dlg.checkCancelled();
          dlg.status2.text = "Integrating starless comet frames...";
          dlg.log("Running ImageIntegration on starless frames...");
          let cometWin = runIntegration(sn.files);
 
+         dlg.checkCancelled();
          dlg.status2.text = "Isolating stars and screen-blending...";
          dlg.log("Isolating reference stars and blending over comet stack...");
          let finalWin = combine(dlg.orderedEntries[0].path, cometWin, dlg.workDir);
@@ -1118,8 +1588,13 @@ function CometStackDialog() {
          dlg.isCompleted = true;
          setHighlight(dlg.closeButton, true);
       } catch (e) {
-         dlg.status2.text = "Stacking failed — see error dialog or log.";
-         showErrorDialog("Comet Stack", e, dlg.log);
+         if (e instanceof UserStoppedError) {
+            dlg.status2.text = "Stacking stopped by user — click button to restart.";
+            dlg.log("Stacking stopped by user.");
+         } else {
+            dlg.status2.text = "Stacking failed — see error dialog or log.";
+            showErrorDialog("Comet Stack", e, dlg.log);
+         }
       } finally {
          dlg.setControlsBusy(false);
          if (!dlg.isRunning && !dlg.isCompleted && dlg.orderedEntries.length >= 3) {
@@ -1140,6 +1615,7 @@ function CometStackDialog() {
    // Group 3: Live Process Log
    this.logGroup = new GroupBox(this);
    this.logGroup.title = "Process Activity Log";
+   this.logGroup.styleSheet = "QGroupBox { font-size: 10.5pt; font-weight: bold; }";
 
    this.logBox = new TextBox(this.logGroup);
    this.logBox.readOnly = true;
@@ -1151,23 +1627,64 @@ function CometStackDialog() {
    this.logGroup.sizer.spacing = 6;
    this.logGroup.sizer.add(this.logBox);
 
-   // Footer
+   // Footer: Stop Process, Close, Info / Process, Donate (uniformly sized)
+   const FOOTER_BTN_W = 122;
+   const FOOTER_BTN_H = 30;
+
+   this.stopButton = new PushButton(this);
+   this.stopButton.text = "Stop Process";
+   this.stopButton.setFixedSize(FOOTER_BTN_W, FOOTER_BTN_H);
+   this.stopButton.enabled = false;
+   setStopHighlight(this.stopButton, false);
+   this.stopButton.onClick = function() {
+      if (dlg.isRunning && !dlg.cancelRequested) {
+         dlg.cancelRequested = true;
+         dlg.stopButton.enabled = false;
+         setStopHighlight(dlg.stopButton, false);
+         dlg.log("Stop requested — halting after current operation...");
+         processEvents();
+      }
+   };
+
    this.closeButton = new PushButton(this);
    this.closeButton.text = "Close";
+   this.closeButton.setFixedSize(FOOTER_BTN_W, FOOTER_BTN_H);
    setHighlight(this.closeButton, false);
    this.closeButton.onClick = function() {
       if (!dlg.isRunning) dlg.ok();
    };
 
+   this.infoButton = new PushButton(this);
+   this.infoButton.text = "Info / Process";
+   this.infoButton.setFixedSize(FOOTER_BTN_W, FOOTER_BTN_H);
+   this.infoButton.toolTip = "View PixInsight requirements (such as StarNet2) and a rundown of how jump-aware stacking works";
+   this.infoButton.styleSheet = "QPushButton { padding: 6px 10px; }";
+   this.infoButton.onClick = function() {
+      showInfoDialog(dlg);
+   };
+
+   this.donateButton = new PushButton(this);
+   this.donateButton.text = "Donate";
+   this.donateButton.setFixedSize(FOOTER_BTN_W, FOOTER_BTN_H);
+   this.donateButton.toolTip = "Support CometStack development via PayPal (" + DONATE_URL + ")";
+   setDonateStyle(this.donateButton);
+   this.donateButton.onClick = function() {
+      dlg.log("Donation link: " + DONATE_URL);
+      openExternalUrl(DONATE_URL, dlg, dlg.log);
+   };
+
    let footerSizer = new HorizontalSizer;
+   footerSizer.spacing = 8;
+   footerSizer.add(this.stopButton);
    footerSizer.addStretch();
    footerSizer.add(this.closeButton);
+   footerSizer.add(this.infoButton);
+   footerSizer.add(this.donateButton);
 
    this.sizer = new VerticalSizer;
    this.sizer.margin = 12;
    this.sizer.spacing = 8;
    this.sizer.add(headerSizer);
-   this.sizer.add(this.creditLabel);
    this.sizer.add(this.prepGroup);
    this.sizer.add(this.cometGroup);
    this.sizer.add(this.logGroup);
