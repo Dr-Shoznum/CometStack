@@ -43,6 +43,15 @@ var GAP_MINUTES = 45;
 var SHIFT_JUMP_THRESHOLD = 80; // pixels between consecutive star-aligned frames
 var EXTREME_SHIFT_THRESHOLD = 250; // pixels threshold for logging a large-shift warning
 var LOCAL_SEARCH_RADIUS = 35;
+var ANCHOR_REFINE_RADIUS = 20;   // snap radius when re-centering the user's anchor clicks
+var REFINE_GAUSS_SIGMA = 8;      // px, Gaussian window of the iterative centroid
+var REFINE_CAP_SIGMA = 25;       // per-pixel excess is clipped at this many noise sigmas
+var REFINE_MIN_PEAK_SIGMA = 5;   // required smoothed peak above background, in noise sigmas
+var RESTORE_RAW_NUCLEUS = true;    // after the stack-level StarNet2 pass, put the raw nucleus core back
+var NUCLEUS_RESTORE_INNER = 10;    // px: raw pixels restored 100% inside this radius
+var NUCLEUS_RESTORE_OUTER = 30;    // px: soft (cosine) fade back to the cleaned stack at this radius
+var STARNET_ON_COMET_STACK = true; // 2nd StarNet2 pass on the integrated stack (removes faint stars missed per frame)
+var TRAJECTORY_OUTLIER_PX = 6;   // refined position vs. neighbour-median correction
 var DONATE_URL = "https://paypal.me/dpmilevski";
 
 // ---- UI & error helpers ----------------------------------------------------
@@ -318,6 +327,11 @@ let readmeText =
       "   into 'cometStackLayer' using median combination by default (or\n" +
       "   average with tight high-sigma clipping for 4–12 frame stacks)\n" +
       "   so the comet and tail stack cleanly without star-removal trails.\n" +
+      "   One more StarNet2 pass on the integrated stack then removes faint\n" +
+      "   stars that were too dim to detect in single frames (they would\n" +
+      "   otherwise appear as short streaks along the comet's motion).\n" +
+      "   The raw nucleus core is blended back afterwards, in case StarNet2\n" +
+      "   treated the compact nucleus as a star.\n" +
       "7. Star Isolation & Screen Blend: Runs StarNet2 on a copy of the\n" +
       "   star-aligned reference frame, isolates stars via:\n" +
       "      max(0, refStarsLayer - refStarlessLayer)\n" +
@@ -374,9 +388,11 @@ function readDateObs(window) {
 
 function readDateObsFromFile(path) {
    let w = ImageWindow.open(path)[0];
-   let d = readDateObs(w);
-   w.forceClose();
-   return d;
+   try {
+      return readDateObs(w);
+   } finally {
+      w.forceClose();
+   }
 }
 
 function listFiles(dir, regex) {
@@ -398,6 +414,14 @@ function clearDirFiles(dir) {
    for (let i = 0; i < existing.length; ++i) {
       if (File.exists(existing[i])) File.remove(existing[i]);
    }
+}
+
+// Force-closes any open windows whose main-view id is in ids (leftovers of an earlier run).
+function closeWindowsById(ids) {
+   let wins = ImageWindow.windows;
+   for (let i = 0; i < wins.length; ++i)
+      if (ids.indexOf(wins[i].mainView.id) >= 0)
+         wins[i].forceClose();
 }
 
 function peakInRegion(view, cx, cy, halfsize) {
@@ -481,9 +505,15 @@ function measureActiveBounds(filePath) {
    }
 }
 
-// Local centroid refinement around an interpolated prediction (predX, predY).
-// Subtracts local median so coma/background gradients don't bias the center,
-// and falls back to the prediction if signal is weak or drift is extreme.
+// Local centroid refinement around a prediction (predX, predY). Used for BOTH the
+// user-marked anchors and the interpolated intermediate frames, so every position
+// in the trajectory comes from the same estimator.
+//  - background = window median, noise = 1.4826*MAD of the window (robust to coma/stars)
+//  - needs a clear (3x3-smoothed) peak above the background, else falls back
+//  - iterative Gaussian-windowed centroid starting at the prediction; per-pixel
+//    excess is clipped at REFINE_CAP_SIGMA*noise so bright stars cannot dominate
+//    the extended coma
+//  - falls back to the prediction if the result drifts too far from it
 function refineNucleusLocally(filePath, predX, predY, radius) {
    let w = ImageWindow.open(filePath)[0];
    try {
@@ -496,6 +526,7 @@ function refineNucleusLocally(filePath, predX, predY, radius) {
       let rect = new Rect(x0, y0, x1, y1);
       let ww = rect.x1 - rect.x0, hh = rect.y1 - rect.y0;
       let n = img.numberOfChannels;
+      let unrefined = { pos: [predX, predY], refined: false };
 
       let acc = new Float64Array(ww * hh);
       let buf = new Float64Array(ww * hh);
@@ -504,39 +535,53 @@ function refineNucleusLocally(filePath, predX, predY, radius) {
          for (let i = 0; i < buf.length; ++i) acc[i] += buf[i];
       }
 
-      let sorted = Array.prototype.slice.call(acc).sort(function(a, b) { return a - b; });
-      let bkg = sorted[Math.floor(sorted.length * 0.5)] || 0;
-      let peak = sorted[sorted.length - 1] || 0;
-      let q90 = sorted[Math.floor(sorted.length * 0.9)] || bkg;
-      let q10 = sorted[Math.floor(sorted.length * 0.1)] || bkg;
-      let spread = Math.max(1e-9, q90 - q10);
+      let byValue = function(a, b) { return a - b; };
+      let sorted = Array.prototype.slice.call(acc).sort(byValue);
+      let bkg = sorted[Math.floor(sorted.length * 0.5)];
+      let absDev = new Array(acc.length);
+      for (let i = 0; i < acc.length; ++i) absDev[i] = Math.abs(acc[i] - bkg);
+      absDev.sort(byValue);
+      let sigma = Math.max(1e-9, 1.4826 * absDev[Math.floor(absDev.length * 0.5)]);
 
-      // Require a clear local peak above background so we don't lock onto pure noise.
-      if ((peak - bkg) < 2.5 * spread) {
-         return { pos: [predX, predY], refined: false };
-      }
-
-      let sumW = 0, sumX = 0, sumY = 0;
-      for (let yy = 0; yy < hh; ++yy) {
-         for (let xx = 0; xx < ww; ++xx) {
-            let excess = acc[yy * ww + xx] - bkg;
-            if (excess > 0) {
-               let weight = excess * excess;
-               sumW += weight;
-               sumX += weight * (rect.x0 + xx);
-               sumY += weight * (rect.y0 + yy);
-            }
+      // Require a clear peak (3x3 box-smoothed, so a single hot pixel does not count).
+      let smPeak = -Infinity;
+      for (let yy = 1; yy < hh - 1; ++yy) {
+         for (let xx = 1; xx < ww - 1; ++xx) {
+            let sum = 0;
+            for (let dy = -1; dy <= 1; ++dy)
+               for (let dx = -1; dx <= 1; ++dx)
+                  sum += acc[(yy + dy) * ww + (xx + dx)];
+            let m = sum / 9;
+            if (m > smPeak) smPeak = m;
          }
       }
+      if (!(smPeak - bkg >= REFINE_MIN_PEAK_SIGMA * sigma)) return unrefined;
 
-      if (sumW <= 0) return { pos: [predX, predY], refined: false };
-      let cx = sumX / sumW, cy = sumY / sumW;
-      let dx = cx - predX, dy = cy - predY;
-      let dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist > r * 0.75) {
-         return { pos: [predX, predY], refined: false };
+      let cap = REFINE_CAP_SIGMA * sigma;
+      let twoS2 = 2 * REFINE_GAUSS_SIGMA * REFINE_GAUSS_SIGMA;
+      let cx = predX, cy = predY;
+      for (let it = 0; it < 10; ++it) {
+         let sumW = 0, sumX = 0, sumY = 0;
+         for (let yy = 0; yy < hh; ++yy) {
+            for (let xx = 0; xx < ww; ++xx) {
+               let excess = acc[yy * ww + xx] - bkg;
+               if (excess <= 0) continue;
+               if (excess > cap) excess = cap;
+               let px = rect.x0 + xx, py = rect.y0 + yy;
+               let ddx = px - cx, ddy = py - cy;
+               let weight = excess * Math.exp(-(ddx * ddx + ddy * ddy) / twoS2);
+               sumW += weight; sumX += weight * px; sumY += weight * py;
+            }
+         }
+         if (sumW <= 0) return unrefined;
+         let nx = sumX / sumW, ny = sumY / sumW;
+         let moved = Math.sqrt((nx - cx) * (nx - cx) + (ny - cy) * (ny - cy));
+         cx = nx; cy = ny;
+         if (moved < 0.05) break;
       }
 
+      let dist = Math.sqrt((cx - predX) * (cx - predX) + (cy - predY) * (cy - predY));
+      if (dist > r * 0.75) return unrefined;
       return { pos: [cx, cy], refined: true };
    } finally {
       w.forceClose();
@@ -595,9 +640,10 @@ function finalizeStretch(stats, targetBkg) {
 
 // ---- Nucleus picker rendering ----------------------------------------------
 
-function prepareOverviewData(image, maxW) {
+function prepareOverviewData(image, maxW, maxH) {
    let n = image.numberOfChannels;
-   let scale = Math.min(1, maxW / image.width);
+   // Fit BOTH dimensions into the picker view (4:3 and squarer frames used to overflow the height).
+   let scale = Math.min(1, maxW / image.width, maxH / image.height);
    let outW = Math.max(1, Math.round(image.width * scale));
    let outH = Math.max(1, Math.round(image.height * scale));
    let block = Math.max(1, Math.round(1 / scale));
@@ -704,7 +750,7 @@ function pickNucleus(filePath, title, subtitle) {
    let result = null;
 
    const VIEWW = 900, VIEWH = 640;
-   const ZOOM_HALFSIZE = 110, ZOOM_FACTOR = 3;
+   const ZOOM_HALFSIZE = 100, ZOOM_FACTOR = 3; // 2*100*3 = 600 px, fits the 640 px view height
    const TAP_TOLERANCE = 6;
 
    let dlg = new Dialog;
@@ -714,7 +760,7 @@ function pickNucleus(filePath, title, subtitle) {
    let channelStats = computeChannelStats(img, img.numberOfChannels);
    let stretch = finalizeStretch(channelStats, TARGET_BKG);
    let state = { mode: "overview", overviewData: null, overview: null, zoomData: null, zoom: null, dragStart: null, dragCur: null };
-   state.overviewData = prepareOverviewData(img, VIEWW);
+   state.overviewData = prepareOverviewData(img, VIEWW, VIEWH);
    state.overview = renderFromPrepared(state.overviewData, stretch);
 
    const OVERVIEW_HINT = "Click roughly on the comet's nucleus to zoom in.";
@@ -751,6 +797,8 @@ function pickNucleus(filePath, title, subtitle) {
 
    view.onMousePress = function(x, y, button, buttons, modifiers) {
       if (state.mode == "overview") {
+         // Ignore clicks on the black margin outside the rendered overview.
+         if (x >= state.overviewData.outW || y >= state.overviewData.outH) return true;
          let nx = x / state.overview.scale;
          let ny = y / state.overview.scale;
          state.zoomCx = nx; state.zoomCy = ny;
@@ -813,15 +861,28 @@ function pickNucleus(filePath, title, subtitle) {
 function readFrameMeta(path) {
    let w = ImageWindow.open(path)[0];
    let meta = { camera: null, gain: null, bin: null, exptime: null, temp: null };
-   for (let k = 0; k < w.keywords.length; ++k) {
-      let kw = w.keywords[k], v = kw.value.toString().replace(/'/g, "").trim();
-      if (kw.name == "CAMERA") meta.camera = v;
-      else if (kw.name == "GAIN") meta.gain = parseFloat(v);
-      else if (kw.name == "XBINNING") meta.bin = parseInt(v, 10);
-      else if (kw.name == "EXPTIME") meta.exptime = parseFloat(v);
-      else if (kw.name == "DET-TEMP") meta.temp = parseFloat(v);
+   try {
+      // DWARF-style headers use CAMERA / DET-TEMP; ASI/ASIAIR/NINA-style headers use
+      // INSTRUME and CCD-TEMP (or SET-TEMP). The first form found wins.
+      let instrume = null, ccdTemp = null, setTemp = null, exposure = null;
+      for (let k = 0; k < w.keywords.length; ++k) {
+         let kw = w.keywords[k], v = kw.value.toString().replace(/'/g, "").trim();
+         if (kw.name == "CAMERA") meta.camera = v;
+         else if (kw.name == "INSTRUME") instrume = v;
+         else if (kw.name == "GAIN") meta.gain = parseFloat(v);
+         else if (kw.name == "XBINNING") meta.bin = parseInt(v, 10);
+         else if (kw.name == "EXPTIME") meta.exptime = parseFloat(v);
+         else if (kw.name == "EXPOSURE") exposure = parseFloat(v);
+         else if (kw.name == "DET-TEMP") meta.temp = parseFloat(v);
+         else if (kw.name == "CCD-TEMP") ccdTemp = parseFloat(v);
+         else if (kw.name == "SET-TEMP") setTemp = parseFloat(v);
+      }
+      if (meta.camera == null) meta.camera = instrume;
+      if (meta.exptime == null || isNaN(meta.exptime)) meta.exptime = exposure;
+      if (meta.temp == null || isNaN(meta.temp)) meta.temp = (ccdTemp != null && !isNaN(ccdTemp)) ? ccdTemp : setTemp;
+   } finally {
+      w.forceClose();
    }
-   w.forceClose();
    return meta;
 }
 
@@ -884,9 +945,18 @@ function findBestDark(lib, camera, gain, bin_, exptime, targetTemp) {
    let cands = lib.filter(function(r) { return r.kind == "dark" && r.camera == camera && r.gain == gain && r.bin == bin_ && r.exptime != null && r.temp != null; });
    if (cands.length == 0) return null;
    let exact = cands.filter(function(r) { return Math.abs(r.exptime - exptime) < 0.01; });
+   let haveTemp = (targetTemp != null && !isNaN(targetTemp));
+   let tDiff = function(r) { return haveTemp ? Math.abs(r.temp - targetTemp) : 0; };
    let pool = exact.length > 0 ? exact : cands;
-   pool = pool.slice().sort(function(a, b) { return Math.abs(a.temp - targetTemp) - Math.abs(b.temp - targetTemp); });
-   return { path: pool[0].path, approxExptime: exact.length == 0, usedExptime: pool[0].exptime, tempDiff: Math.abs(pool[0].temp - targetTemp) };
+   // Exact exposure: closest temperature. Otherwise: closest exposure first, then temperature.
+   pool = pool.slice().sort(function(a, b) {
+      if (exact.length == 0) {
+         let de = Math.abs(a.exptime - exptime) - Math.abs(b.exptime - exptime);
+         if (Math.abs(de) > 1e-6) return de;
+      }
+      return tDiff(a) - tDiff(b);
+   });
+   return { path: pool[0].path, approxExptime: exact.length == 0, usedExptime: pool[0].exptime, tempDiff: tDiff(pool[0]), haveTemp: haveTemp };
 }
 
 function findBestBias(lib, camera, gain, bin_) {
@@ -927,7 +997,7 @@ function materializeMasterFrame(rec, workDir, label) {
    return outPath;
 }
 
-function runCalibration(files, workDir, masterDarkPath, masterBiasPath, masterFlatPath) {
+function runCalibration(files, workDir, masterDarkPath, masterBiasPath, masterFlatPath, approxDark) {
    let outDir = workDir + "/0_calibrated";
    if (!File.directoryExists(outDir)) File.createDirectory(outDir, true);
    let existing = listFiles(outDir, /_c\.xisf$/i);
@@ -944,6 +1014,11 @@ function runCalibration(files, workDir, masterDarkPath, masterBiasPath, masterFl
    P.masterBiasPath = masterBiasPath || "";
    P.masterFlatEnabled = !!masterFlatPath;
    P.masterFlatPath = masterFlatPath || "";
+   if (approxDark) {
+      // The master dark has a different exposure than the lights: it must be scaled.
+      P.optimizeDarks = true;
+      P.enableCFA = true; // lights are still un-debayered (CFA) at this stage
+   }
    P.outputDirectory = outDir;
    P.outputPostfix = "_c";
    P.overwriteExistingFiles = true;
@@ -1076,12 +1151,21 @@ function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
       .sort(function(a, b) { return a - b; });
 
    let positions = new Array(entries.length);
+
+   // Re-center each anchor click with the SAME estimator used for the intermediate
+   // frames, so there is no systematic offset between anchors and refined frames.
+   let anchorsRefined = 0;
    for (let a = 0; a < anchorIndices.length; ++a) {
+      processEvents();
+      if (checkStopFn) checkStopFn();
       let idx = anchorIndices[a];
-      positions[idx] = anchorCoordsByIdx[idx];
+      let click = anchorCoordsByIdx[idx];
+      let loc = refineNucleusLocally(entries[idx].path, click[0], click[1], ANCHOR_REFINE_RADIUS);
+      positions[idx] = loc.pos;
+      if (loc.refined) ++anchorsRefined;
    }
 
-   let refinedCount = 0;
+   let refinedCount = 0, outlierCount = 0;
    for (let a = 0; a < anchorIndices.length - 1; ++a) {
       let i0 = anchorIndices[a];
       let i1 = anchorIndices[a + 1];
@@ -1091,6 +1175,7 @@ function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
       let p0 = positions[i0];
       let p1 = positions[i1];
 
+      let pred = {}, corr = {};   // per-frame prediction and refined correction
       for (let k = i0 + 1; k < i1; ++k) {
          processEvents();
          if (checkStopFn) checkStopFn();
@@ -1099,12 +1184,41 @@ function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
          let predY = p0[1] + t * (p1[1] - p0[1]);
          let loc = refineNucleusLocally(entries[k].path, predX, predY, LOCAL_SEARCH_RADIUS);
          positions[k] = loc.pos;
-         if (loc.refined) ++refinedCount;
+         pred[k] = [predX, predY];
+         if (loc.refined) {
+            ++refinedCount;
+            corr[k] = [loc.pos[0] - predX, loc.pos[1] - predY];
+         }
+      }
+
+      // Outlier pass: the interpolation error is smooth in time, so a refined frame whose
+      // correction disagrees with the median correction of its neighbours (+-3 frames)
+      // most likely locked onto a star or noise. Replace it with prediction + neighbour median.
+      let medianOf = function(arr) {
+         let b = arr.slice().sort(function(x, y) { return x - y; });
+         let m = b.length >> 1;
+         return (b.length % 2) ? b[m] : 0.5 * (b[m - 1] + b[m]);
+      };
+      for (let k = i0 + 1; k < i1; ++k) {
+         if (!corr[k]) continue;
+         let nx = [], ny = [];
+         for (let j = Math.max(i0 + 1, k - 3); j <= Math.min(i1 - 1, k + 3); ++j) {
+            if (j !== k && corr[j]) { nx.push(corr[j][0]); ny.push(corr[j][1]); }
+         }
+         if (nx.length < 3) continue;
+         let mx = medianOf(nx), my = medianOf(ny);
+         let dx = corr[k][0] - mx, dy = corr[k][1] - my;
+         if (Math.sqrt(dx * dx + dy * dy) > TRAJECTORY_OUTLIER_PX) {
+            positions[k] = [pred[k][0] + mx, pred[k][1] + my];
+            ++outlierCount;
+         }
       }
    }
 
    if (logFn) {
-      logFn("   Refined " + refinedCount + " of " + Math.max(0, entries.length - anchorIndices.length) + " intermediate frame(s) via local centroid search.");
+      logFn("   Re-centered " + anchorsRefined + " of " + anchorIndices.length + " anchor click(s) with the local centroid.");
+      logFn("   Refined " + refinedCount + " of " + Math.max(0, entries.length - anchorIndices.length) + " intermediate frame(s) via local centroid search" +
+            (outlierCount > 0 ? "; corrected " + outlierCount + " outlier position(s) against neighbouring frames." : "."));
    }
    return positions;
 }
@@ -1220,17 +1334,88 @@ function runIntegration(files, mode) {
    P.evaluateSNR = false;
    if (!P.executeGlobal()) throw new Error("ImageIntegration failed.");
    let w = ImageWindow.windowById(P.integrationImageId);
+   // A kept-for-recovery stack from an earlier failed run would otherwise collide with this id.
+   closeWindowsById(["cometStackLayer"]);
    w.mainView.id = "cometStackLayer";
    return w;
+}
+
+// Faint stars that StarNet2 cannot detect in a single frame stay in every starless frame; the
+// comet alignment then smears them into short streaks in the integrated stack. In the (much
+// deeper) stack they are detectable, so one extra StarNet2 pass on that single image removes them.
+// StarNet2 can also take part of the compact nucleus (it looks like a star), so the raw pixels
+// around the nucleus are copied first and blended back afterwards (full strength inside
+// NUCLEUS_RESTORE_INNER px, cosine fade to the cleaned data at NUCLEUS_RESTORE_OUTER px).
+// Returns true if the pass was applied.
+function removeResidualStarsFromStack(cometWin, nucleusX, nucleusY, logFn) {
+   let view = cometWin.mainView;
+   let before = peakInRegion(view, nucleusX, nucleusY, 40);
+
+   // Keep the raw pixels around the nucleus.
+   let R0 = NUCLEUS_RESTORE_INNER, R1 = Math.max(NUCLEUS_RESTORE_OUTER, NUCLEUS_RESTORE_INNER + 1);
+   let img = view.image;
+   let x0 = Math.max(0, Math.floor(nucleusX - R1)), y0 = Math.max(0, Math.floor(nucleusY - R1));
+   let x1 = Math.min(img.width, Math.ceil(nucleusX + R1) + 1), y1 = Math.min(img.height, Math.ceil(nucleusY + R1) + 1);
+   let rect = new Rect(x0, y0, x1, y1);
+   let ww = x1 - x0, hh = y1 - y0;
+   let n = img.numberOfChannels;
+   let rawBuf = [];
+   if (RESTORE_RAW_NUCLEUS) {
+      for (let ch = 0; ch < n; ++ch) {
+         let b = new Float64Array(ww * hh);
+         img.getSamples(b, rect, ch);
+         rawBuf.push(b);
+      }
+   }
+
+   let P = new StarNet2;
+   P.mask = false;
+   P.linear = true;
+   P.executeOn(view);
+   let afterStarnet = peakInRegion(view, nucleusX, nucleusY, 40);
+
+   let after = afterStarnet;
+   if (RESTORE_RAW_NUCLEUS) {
+      view.beginProcess();
+      try {
+         let cur = view.image;
+         let cleanBuf = new Float64Array(ww * hh);
+         for (let ch = 0; ch < n; ++ch) {
+            cur.getSamples(cleanBuf, rect, ch);
+            for (let i = 0; i < cleanBuf.length; ++i) {
+               let px = x0 + (i % ww), py = y0 + Math.floor(i / ww);
+               let d = Math.sqrt((px - nucleusX) * (px - nucleusX) + (py - nucleusY) * (py - nucleusY));
+               let wgt = (d <= R0) ? 1 : ((d >= R1) ? 0 : 0.5 * (1 + Math.cos(Math.PI * (d - R0) / (R1 - R0))));
+               if (wgt > 0) cleanBuf[i] += wgt * (rawBuf[ch][i] - cleanBuf[i]);
+            }
+            cur.setSamples(cleanBuf, rect, ch);
+         }
+      } finally {
+         view.endProcess();
+      }
+      after = peakInRegion(view, nucleusX, nucleusY, 40);
+   }
+
+   if (logFn) {
+      let pct = function(v) { return before > 0 ? (100 * v / before).toFixed(0) + "%" : "n/a"; };
+      if (RESTORE_RAW_NUCLEUS)
+         logFn("   Stack-level StarNet2 pass done. Nucleus peak after StarNet2: " + pct(afterStarnet) +
+               " of the raw stack; after restoring the raw core (" + R0 + "-" + R1 + " px): " + pct(after) + ".");
+      else
+         logFn("   Stack-level StarNet2 pass done. Nucleus peak kept at " + pct(afterStarnet) + " of the raw stack.");
+   }
+   return true;
 }
 
 // Isolates stars from the star-aligned reference frame by subtracting its
 // StarNet2 starless version, then screen-blends starsOnly over cometStackLayer
 // so single-frame background noise does not clip into the comet via max().
 function combine(refStarPath, cometWindow, workDir) {
+   // Leftover temporaries from an earlier failed run would collide with the ids used below.
+   closeWindowsById(["refStarsLayer", "refStarlessLayer", "starsOnlyLayer"]);
    let starWin = ImageWindow.open(refStarPath)[0];
    let starlessWin = ImageWindow.open(refStarPath)[0];
-   let keepCometWindow = false;
+   let succeeded = false;
    try {
       let sn = new StarNet2;
       sn.mask = false;
@@ -1252,6 +1437,9 @@ function combine(refStarPath, cometWindow, workDir) {
 
       let starsOnlyWin = ImageWindow.windowById("starsOnlyLayer");
       try {
+         // PixelMath gives the new image a different id if "CometStack_final" is already open
+         // (e.g. the result of a previous run), so identify the new window by diffing the list.
+         let idsBefore = ImageWindow.windows.map(function(w) { return w.mainView.id; });
          let blendPM = new PixelMath;
          blendPM.expression = "1 - (1 - cometStackLayer) * (1 - starsOnlyLayer)";
          blendPM.useSingleExpression = true;
@@ -1260,16 +1448,24 @@ function combine(refStarPath, cometWindow, workDir) {
          blendPM.showNewImage = true;
          blendPM.rescale = false;
          blendPM.truncate = true;
-         if (!blendPM.executeOn(cometWindow.mainView)) {
-            keepCometWindow = true;
-            throw new Error("PixelMath screen blend failed.");
+         if (!blendPM.executeOn(cometWindow.mainView)) throw new Error("PixelMath screen blend failed.");
+
+         let finalWin = null;
+         let wins = ImageWindow.windows;
+         for (let i = 0; i < wins.length; ++i) {
+            if (idsBefore.indexOf(wins[i].mainView.id) < 0) { finalWin = wins[i]; break; }
          }
-         return ImageWindow.windowById("CometStack_final");
+         if (!finalWin) finalWin = ImageWindow.windowById("CometStack_final");
+         if (!finalWin || finalWin.isNull) throw new Error("Could not locate the blended result window.");
+         succeeded = true;
+         return finalWin;
       } finally {
          if (starsOnlyWin) starsOnlyWin.forceClose();
       }
    } finally {
-      if (!keepCometWindow && cometWindow) cometWindow.forceClose();
+      // Only discard the integrated comet stack once the final image exists; on any failure
+      // it stays open (and was already saved to disk by the caller) so no work is lost.
+      if (succeeded && cometWindow) cometWindow.forceClose();
       starlessWin.forceClose();
       starWin.forceClose();
    }
@@ -1293,7 +1489,7 @@ function CometStackDialog() {
 
    let cometIcon = createCometIconBitmap(22);
 
-   this.windowTitle = "OSC Comet Stacking";
+   this.windowTitle = "OSC Comet Stacking Script";
    this.minWidth = 560;
    this.position = new Point(100, 100);
 
@@ -1329,7 +1525,7 @@ function CometStackDialog() {
    this.headerIcon.setFixedSize(22, 22);
 
    this.headerLabel = new Label(this);
-   this.headerLabel.text = "OSC Comet Stacking";
+   this.headerLabel.text = "OSC Comet Stacking Script";
    this.headerLabel.styleSheet = "font-size: 13.5pt; font-weight: bold;";
 
    let headerSizer = new HorizontalSizer;
@@ -1409,6 +1605,13 @@ function CometStackDialog() {
             dlg.status1.text = "Matching calibration frames...";
             dlg.log("Matching calibration frames against light metadata...");
             let lightMeta = readFrameMeta(dlg.inputFiles[0]);
+            let missingKw = [];
+            if (!lightMeta.camera) missingKw.push("CAMERA/INSTRUME");
+            if (lightMeta.gain == null || isNaN(lightMeta.gain)) missingKw.push("GAIN");
+            if (lightMeta.bin == null || isNaN(lightMeta.bin)) missingKw.push("XBINNING");
+            if (lightMeta.exptime == null || isNaN(lightMeta.exptime)) missingKw.push("EXPTIME");
+            if (missingKw.length > 0)
+               dlg.log("   NOTE: the first light frame's header has no " + missingKw.join(", ") + "; calibration frames that need it cannot be matched.");
             let temps = dlg.inputFiles.map(function(p) { return readFrameMeta(p).temp; }).filter(function(t) { return t != null; });
             let avgTemp = temps.length ? (temps.reduce(function(a, b) { return a + b; }, 0) / temps.length) : lightMeta.temp;
 
@@ -1423,8 +1626,8 @@ function CometStackDialog() {
             let darkPath = null, biasPath = null, flatPath = null;
             if (darkMatch) {
                darkPath = materializeMasterFrame({ path: darkMatch.path, exptime: darkMatch.usedExptime, gain: lightMeta.gain, bin: lightMeta.bin, temp: null }, dlg.workDir, "dark");
-               msgs.push("dark " + (darkMatch.approxExptime ? "(closest exptime " + darkMatch.usedExptime + "s) " : "") +
-                  "@ " + darkMatch.tempDiff.toFixed(0) + "°C diff");
+               msgs.push("dark " + (darkMatch.approxExptime ? "(closest exptime " + darkMatch.usedExptime + "s, dark optimization on) " : "") +
+                  (darkMatch.haveTemp ? "@ " + darkMatch.tempDiff.toFixed(0) + "°C diff" : "(no temperature in light headers)"));
             } else msgs.push("no dark");
             if (biasRec) {
                biasPath = materializeMasterFrame(biasRec, dlg.workDir, "bias");
@@ -1441,7 +1644,7 @@ function CometStackDialog() {
                dlg.checkCancelled();
                dlg.status1.text = "Calibrating (" + msgs.join(", ") + ")...";
                dlg.log("Running ImageCalibration...");
-               filesToDebayer = runCalibration(dlg.inputFiles, dlg.workDir, darkPath, biasPath, flatPath);
+               filesToDebayer = runCalibration(dlg.inputFiles, dlg.workDir, darkPath, biasPath, flatPath, !!(darkMatch && darkMatch.approxExptime));
             } else {
                dlg.log("No applicable calibration frames matched; proceeding uncalibrated.");
             }
@@ -1571,7 +1774,7 @@ function CometStackDialog() {
          dlg.checkCancelled();
          dlg.status2.text = "Running StarNet2 on " + caFiles.length + " frames...";
          dlg.log("Removing stars with StarNet2...");
-         let refNucleus = coordsByIdx[0];
+         let refNucleus = positions[0];
          let sn = runStarNet2Batch(caFiles, dlg.workDir, refNucleus[0], refNucleus[1], dlg.log, function(msg) {
             dlg.status2.text = msg;
             processEvents();
@@ -1582,6 +1785,25 @@ function CometStackDialog() {
          dlg.status2.text = "Integrating starless comet frames (" + integMode + ")...";
          dlg.log("Running ImageIntegration (" + integMode.toUpperCase() + ") on " + sn.files.length + " starless frames...");
          let cometWin = runIntegration(sn.files, integMode);
+         try {
+            let cometSavePath = dlg.workDir + "/CometStack_cometStack.xisf";
+            cometWin.saveAs(cometSavePath, false, false, false, false);
+            dlg.log("Saved integrated starless comet stack: " + cometSavePath);
+         } catch (e) {
+            dlg.log("Note: could not save the intermediate comet stack (" + (e && e.message ? e.message : e) + ").");
+         }
+
+         if (STARNET_ON_COMET_STACK) {
+            dlg.checkCancelled();
+            dlg.status2.text = "Removing residual faint stars from the integrated stack (StarNet2)...";
+            dlg.log("Running StarNet2 on the integrated comet stack to remove faint residual stars...");
+            removeResidualStarsFromStack(cometWin, positions[0][0], positions[0][1], dlg.log);
+            try {
+               cometWin.saveAs(dlg.workDir + "/CometStack_cometStack_clean.xisf", false, false, false, false);
+            } catch (e) {
+               dlg.log("Note: could not save the cleaned comet stack (" + (e && e.message ? e.message : e) + ").");
+            }
+         }
 
          dlg.checkCancelled();
          dlg.status2.text = "Isolating stars and screen-blending...";
@@ -1604,6 +1826,8 @@ function CometStackDialog() {
             dlg.log("Stacking stopped by user.");
          } else {
             dlg.status2.text = "Stacking failed — see error dialog or log.";
+            if (ImageWindow.windowById("cometStackLayer") && !ImageWindow.windowById("cometStackLayer").isNull)
+               dlg.log("The integrated comet stack is still open as 'cometStackLayer' and is saved as CometStack_cometStack.xisf in the work folder.");
             showErrorDialog("Comet Stack", e, dlg.log);
          }
       } finally {
