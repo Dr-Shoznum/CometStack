@@ -50,6 +50,9 @@ var REFINE_MIN_PEAK_SIGMA = 5;   // required smoothed peak above background, in 
 var RESTORE_RAW_NUCLEUS = true;    // after the stack-level StarNet2 pass, put the raw nucleus core back
 var NUCLEUS_RESTORE_INNER = 10;    // px: raw pixels restored 100% inside this radius
 var NUCLEUS_RESTORE_OUTER = 30;    // px: soft (cosine) fade back to the cleaned stack at this radius
+var DEEP_STAR_LAYER = true;        // star layer from ALL star-aligned frames instead of a single frame
+var STAR_MASK_INNER = 20;          // px: no deep-stack stars within this distance of the comet's path
+var STAR_MASK_OUTER = 40;          // px: cosine fade back to full star layer at this distance
 var STARNET_ON_COMET_STACK = true; // 2nd StarNet2 pass on the integrated stack (removes faint stars missed per frame)
 var TRAJECTORY_OUTLIER_PX = 6;   // refined position vs. neighbour-median correction
 var DONATE_URL = "https://paypal.me/dpmilevski";
@@ -332,8 +335,13 @@ let readmeText =
       "   otherwise appear as short streaks along the comet's motion).\n" +
       "   The raw nucleus core is blended back afterwards, in case StarNet2\n" +
       "   treated the compact nucleus as a star.\n" +
-      "7. Star Isolation & Screen Blend: Runs StarNet2 on a copy of the\n" +
-      "   star-aligned reference frame, isolates stars via:\n" +
+      "7. Star Isolation & Screen Blend: All star-aligned frames are first\n" +
+      "   integrated (average, Winsorized clipping) into a deep star stack,\n" +
+      "   saved as CometStack_starStack.xisf. The stack is then used as the\n" +
+      "   star source (if it cannot be built, the single star-aligned\n" +
+      "   reference frame is used instead). Around the comet's path the star\n" +
+      "   layer is faded out, because the comet is smeared in that stack.\n" +
+      "   StarNet2 is run on a copy of the star source, and stars are isolated via:\n" +
       "      max(0, refStarsLayer - refStarlessLayer)\n" +
       "   and screen-blends them over the comet stack via:\n" +
       "      1 - (1 - cometStackLayer) * (1 - starsOnlyLayer)\n" +
@@ -1155,6 +1163,8 @@ function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
    // Re-center each anchor click with the SAME estimator used for the intermediate
    // frames, so there is no systematic offset between anchors and refined frames.
    let anchorsRefined = 0;
+   let anchorShifts = [];      // click -> local centroid distance (px), for the robustness report
+   let anchorLines = [];
    for (let a = 0; a < anchorIndices.length; ++a) {
       processEvents();
       if (checkStopFn) checkStopFn();
@@ -1162,10 +1172,16 @@ function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
       let click = anchorCoordsByIdx[idx];
       let loc = refineNucleusLocally(entries[idx].path, click[0], click[1], ANCHOR_REFINE_RADIUS);
       positions[idx] = loc.pos;
-      if (loc.refined) ++anchorsRefined;
+      if (loc.refined) {
+         ++anchorsRefined;
+         anchorShifts.push(Math.sqrt((loc.pos[0] - click[0]) * (loc.pos[0] - click[0]) + (loc.pos[1] - click[1]) * (loc.pos[1] - click[1])));
+      }
+      anchorLines.push("   Anchor [" + idx + "]: click (" + click[0].toFixed(2) + ", " + click[1].toFixed(2) + ") -> " +
+                       (loc.refined ? "local centroid (" : "kept as clicked (") + loc.pos[0].toFixed(2) + ", " + loc.pos[1].toFixed(2) + ")");
    }
 
    let refinedCount = 0, outlierCount = 0;
+   let allCorrMags = [];       // |refined - straight-line prediction| (px) for every refined frame
    for (let a = 0; a < anchorIndices.length - 1; ++a) {
       let i0 = anchorIndices[a];
       let i1 = anchorIndices[a + 1];
@@ -1188,6 +1204,7 @@ function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
          if (loc.refined) {
             ++refinedCount;
             corr[k] = [loc.pos[0] - predX, loc.pos[1] - predY];
+            allCorrMags.push(Math.sqrt(corr[k][0] * corr[k][0] + corr[k][1] * corr[k][1]));
          }
       }
 
@@ -1216,6 +1233,13 @@ function computeCometPositions(entries, anchorCoordsByIdx, logFn, checkStopFn) {
    }
 
    if (logFn) {
+      for (let i = 0; i < anchorLines.length; ++i) logFn(anchorLines[i]);
+      if (allCorrMags.length > 0) {
+         let sortedMags = allCorrMags.slice().sort(function(x, y) { return x - y; });
+         logFn("   Intermediate-frame corrections vs. straight-line prediction: median " +
+               sortedMags[sortedMags.length >> 1].toFixed(2) + " px, max " + sortedMags[sortedMags.length - 1].toFixed(2) +
+               " px over " + sortedMags.length + " frame(s).");
+      }
       logFn("   Re-centered " + anchorsRefined + " of " + anchorIndices.length + " anchor click(s) with the local centroid.");
       logFn("   Refined " + refinedCount + " of " + Math.max(0, entries.length - anchorIndices.length) + " intermediate frame(s) via local centroid search" +
             (outlierCount > 0 ? "; corrected " + outlierCount + " outlier position(s) against neighbouring frames." : "."));
@@ -1407,10 +1431,78 @@ function removeResidualStarsFromStack(cometWin, nucleusX, nucleusY, logFn) {
    return true;
 }
 
+// Integrates ALL star-aligned frames (stars are sharp, the comet is smeared over its path) into a
+// deep star stack: much lower noise than a single frame, so many more faint stars survive.
+// Saved to workDir; returns the saved path.
+function buildDeepStarStack(files, workDir) {
+   let P = new ImageIntegration;
+   P.images = files.map(function(p) { return [true, p, "", ""]; });
+   P.inputHints = "";
+   P.combination = ImageIntegration.prototype.Average;
+   P.normalization = ImageIntegration.prototype.AdditiveWithScaling;
+   P.weightMode = ImageIntegration.prototype.NoiseEvaluation;
+   P.rejection = ImageIntegration.prototype.WinsorizedSigmaClip;
+   P.rejectionNormalization = 1; // 0 = None, 1 = Scale + Zero Offset
+   P.sigmaLow = 4.0;
+   P.sigmaHigh = 3.0;
+   P.rangeClipLow = true;  // ignore the empty (zero) borders left by StarAlignment
+   P.rangeLow = 0.0;
+   P.generateRejectionMaps = false;
+   P.evaluateSNR = false;
+   if (!P.executeGlobal()) throw new Error("ImageIntegration of the star-aligned frames failed.");
+   let w = ImageWindow.windowById(P.integrationImageId);
+   let outPath = workDir + "/CometStack_starStack.xisf";
+   try {
+      w.saveAs(outPath, false, false, false, false);
+   } finally {
+      w.forceClose();
+   }
+   return outPath;
+}
+
+function distToSegment(px, py, ax, ay, bx, by) {
+   let dx = bx - ax, dy = by - ay;
+   let len2 = dx * dx + dy * dy;
+   let t = (len2 > 0) ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+   t = Math.max(0, Math.min(1, t));
+   let cx = ax + t * dx, cy = ay + t * dy;
+   return Math.sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+}
+
+// The comet is smeared along its path in the star-aligned stack, and StarNet2 may split part of
+// that smear off as "stars". Fade the star layer to zero around the comet's path so the
+// comet-aligned stack alone provides the comet (zero inside r0, cosine fade up to full at r1).
+function maskStarsAroundComet(view, a, b, r0, r1) {
+   let img = view.image;
+   let x0 = Math.max(0, Math.floor(Math.min(a[0], b[0]) - r1)), y0 = Math.max(0, Math.floor(Math.min(a[1], b[1]) - r1));
+   let x1 = Math.min(img.width, Math.ceil(Math.max(a[0], b[0]) + r1) + 1), y1 = Math.min(img.height, Math.ceil(Math.max(a[1], b[1]) + r1) + 1);
+   if (x1 <= x0 || y1 <= y0) return;
+   let rect = new Rect(x0, y0, x1, y1);
+   let ww = x1 - x0, hh = y1 - y0;
+   let n = img.numberOfChannels;
+   view.beginProcess();
+   try {
+      let cur = view.image;
+      let buf = new Float64Array(ww * hh);
+      for (let ch = 0; ch < n; ++ch) {
+         cur.getSamples(buf, rect, ch);
+         for (let i = 0; i < buf.length; ++i) {
+            let px = x0 + (i % ww), py = y0 + Math.floor(i / ww);
+            let d = distToSegment(px, py, a[0], a[1], b[0], b[1]);
+            let keep = (d <= r0) ? 0 : ((d >= r1) ? 1 : 0.5 * (1 - Math.cos(Math.PI * (d - r0) / (r1 - r0))));
+            buf[i] *= keep;
+         }
+         cur.setSamples(buf, rect, ch);
+      }
+   } finally {
+      view.endProcess();
+   }
+}
+
 // Isolates stars from the star-aligned reference frame by subtracting its
 // StarNet2 starless version, then screen-blends starsOnly over cometStackLayer
 // so single-frame background noise does not clip into the comet via max().
-function combine(refStarPath, cometWindow, workDir) {
+function combine(refStarPath, cometWindow, workDir, cometPathSegment) {
    // Leftover temporaries from an earlier failed run would collide with the ids used below.
    closeWindowsById(["refStarsLayer", "refStarlessLayer", "starsOnlyLayer"]);
    let starWin = ImageWindow.open(refStarPath)[0];
@@ -1437,6 +1529,9 @@ function combine(refStarPath, cometWindow, workDir) {
 
       let starsOnlyWin = ImageWindow.windowById("starsOnlyLayer");
       try {
+         if (cometPathSegment)
+            maskStarsAroundComet(starsOnlyWin.mainView, cometPathSegment[0], cometPathSegment[1],
+                                 STAR_MASK_INNER, Math.max(STAR_MASK_OUTER, STAR_MASK_INNER + 1));
          // PixelMath gives the new image a different id if "CometStack_final" is already open
          // (e.g. the result of a previous run), so identify the new window by diffing the list.
          let idsBefore = ImageWindow.windows.map(function(w) { return w.mainView.id; });
@@ -1807,8 +1902,26 @@ function CometStackDialog() {
 
          dlg.checkCancelled();
          dlg.status2.text = "Isolating stars and screen-blending...";
-         dlg.log("Isolating reference stars and blending over comet stack...");
-         let finalWin = combine(dlg.orderedEntries[0].path, cometWin, dlg.workDir);
+         let starSource = dlg.orderedEntries[0].path;
+         let cometPathSegment = null;
+         if (DEEP_STAR_LAYER) {
+            try {
+               dlg.status2.text = "Integrating all star-aligned frames for the star layer...";
+               dlg.log("Integrating all " + dlg.orderedEntries.length + " star-aligned frames into a deep star stack...");
+               starSource = buildDeepStarStack(dlg.orderedEntries.map(function(e) { return e.path; }), dlg.workDir);
+               cometPathSegment = [positions[0], positions[positions.length - 1]];
+               dlg.log("Saved deep star stack: " + starSource);
+            } catch (e) {
+               if (e instanceof UserStoppedError) throw e;
+               starSource = dlg.orderedEntries[0].path;
+               cometPathSegment = null;
+               dlg.log("Note: could not build the deep star stack (" + (e && e.message ? e.message : e) + "); using the single reference frame instead.");
+            }
+            dlg.checkCancelled();
+            dlg.status2.text = "Isolating stars and screen-blending...";
+         }
+         dlg.log("Isolating stars (" + (cometPathSegment ? "deep star stack" : "single reference frame") + ") and blending over comet stack...");
+         let finalWin = combine(starSource, cometWin, dlg.workDir, cometPathSegment);
          applyAutoSTF(finalWin.mainView, 2.8, 0.16);
          finalWin.zoomToFit();
          finalWin.show();
