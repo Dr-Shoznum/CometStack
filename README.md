@@ -55,11 +55,17 @@ internally and combining them:
    `cometStackLayer` - using **Median** combination by default to suppress
    faint walking star-removal trails, or **Average** with tight high-sigma
    clipping (`sigmaHigh = 1.1`) for small 4–12 frame stacks - producing a
-   deep, clean comet image without star trails.
-8. **PixelMath** isolates stars from the star-aligned reference frame
-   (`max(0, refStarsLayer - refStarlessLayer)`) and screen-blends them over
-   the comet stack (`1 - (1 - cometStackLayer) * (1 - starsOnlyLayer)`),
+   deep, clean comet image without star trails. A second **StarNet2** pass
+   on the stacked image removes faint stars that were too dim to detect in
+   single frames, and the raw nucleus core is blended back in case StarNet2
+   softened it. This is saved as `CometStack_comet_starless.xisf`.
+8. **ImageIntegration** also stacks all star-aligned frames into a deep star
+   stack (falling back to the single reference frame if that fails), with the
+   star layer faded out along the comet's path. **PixelMath** isolates the
+   stars (`max(0, refStarsLayer - refStarlessLayer)`) and screen-blends them
+   over the comet stack (`1 - (1 - cometStackLayer) * (1 - starsOnlyLayer)`),
    producing `CometStack_final` with both sharp stars and a sharp, deep comet.
+   The deep star stack is temporary and is deleted once the final image exists.
 
 **Running it:** a dialog walks you through the workflow; the button for
 whatever you should click next is highlighted green, cleared when a step starts
@@ -86,10 +92,27 @@ bottom bar provides **Stop Process**, **Close**, **Info / Process**, and
    piecewise interpolation and local centroid refinement, `CometAlignment`,
    `StarNet2`, `ImageIntegration` (median default, or tight-clipped average
    for 4–12 frames), star isolation, screen blending, AutoSTF
-   preview stretch, and saving two files in `CometStack_work` next to your
-   lights: `CometStack_final.xisf` (comet and stars) and
-   `CometStack_comet_starless.xisf` (the comet alone, without stars). The intermediate `cometStackLayer` window is
-   closed automatically once `CometStack_final` is created.
+   preview stretch, and saving the two output files described below. The
+   intermediate `cometStackLayer` window is closed automatically once
+   `CometStack_final` is created.
+
+**Output files:** everything is written to `CometStack_work/` next to your
+lights. A finished run leaves exactly two images there:
+
+| File | Contents |
+|---|---|
+| `CometStack_final.xisf` | The finished image: sharp comet **and** sharp stars. |
+| `CometStack_comet_starless.xisf` | The comet alone, with the stars removed - useful for processing the comet and tail separately. |
+
+The numbered subfolders (`0_calibrated/`, `1_debayer/`, `2_aligned/`,
+`3_comet_aligned/`, `4_starless/`) hold the per-frame working files. The
+first three let a re-run on the same folder skip calibration, debayering and
+alignment; the last two are rebuilt on every run. All of them can be deleted
+once you are happy with the result. `CometStack_comet_starless.xisf` is saved as soon as the comet is
+stacked, so if a later step fails, the comet stack is not lost. Files left by
+older versions of the script (`CometStack_cometStack.xisf`,
+`CometStack_cometStack_clean.xisf`, `CometStack_starStack.xisf`) are removed
+automatically at the end of a successful run.
 
 **Optional calibration frames:** click **Select Calibration Folder (Optional)...**
 and point to the **root folder** containing subfolders named **`dark`**,
