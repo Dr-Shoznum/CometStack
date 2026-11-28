@@ -86,8 +86,9 @@ bottom bar provides **Stop Process**, **Close**, **Info / Process**, and
    piecewise interpolation and local centroid refinement, `CometAlignment`,
    `StarNet2`, `ImageIntegration` (median default, or tight-clipped average
    for 4–12 frames), star isolation, screen blending, AutoSTF
-   preview stretch, and saving `CometStack_final.xisf` in `CometStack_work`
-   next to your lights. The intermediate `cometStackLayer` window is
+   preview stretch, and saving two files in `CometStack_work` next to your
+   lights: `CometStack_final.xisf` (comet and stars) and
+   `CometStack_comet_starless.xisf` (the comet alone, without stars). The intermediate `cometStackLayer` window is
    closed automatically once `CometStack_final` is created.
 
 **Optional calibration frames:** click **Select Calibration Folder (Optional)...**

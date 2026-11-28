@@ -337,7 +337,7 @@ let readmeText =
       "   treated the compact nucleus as a star.\n" +
       "7. Star Isolation & Screen Blend: All star-aligned frames are first\n" +
       "   integrated (average, Winsorized clipping) into a deep star stack,\n" +
-      "   saved as CometStack_starStack.xisf. The stack is then used as the\n" +
+      "   kept only while it is needed. The stack is then used as the\n" +
       "   star source (if it cannot be built, the single star-aligned\n" +
       "   reference frame is used instead). Around the comet's path the star\n" +
       "   layer is faded out, because the comet is smeared in that stack.\n" +
@@ -345,8 +345,9 @@ let readmeText =
       "      max(0, refStarsLayer - refStarlessLayer)\n" +
       "   and screen-blends them over the comet stack via:\n" +
       "      1 - (1 - cometStackLayer) * (1 - starsOnlyLayer)\n" +
-      "   Finally applies an AutoSTF preview stretch and saves\n" +
-      "   CometStack_final.xisf in the working folder.";
+      "   Finally applies an AutoSTF preview stretch and saves two files in\n" +
+      "   the working folder: CometStack_final.xisf (comet and stars) and\n" +
+      "   CometStack_comet_starless.xisf (the comet alone, no stars).";
 
    let docBox = new TextBox(infoDlg);
    docBox.readOnly = true;
@@ -1880,10 +1881,12 @@ function CometStackDialog() {
          dlg.status2.text = "Integrating starless comet frames (" + integMode + ")...";
          dlg.log("Running ImageIntegration (" + integMode.toUpperCase() + ") on " + sn.files.length + " starless frames...");
          let cometWin = runIntegration(sn.files, integMode);
+         let cometStarlessPath = dlg.workDir + "/CometStack_comet_starless.xisf";
          try {
-            let cometSavePath = dlg.workDir + "/CometStack_cometStack.xisf";
-            cometWin.saveAs(cometSavePath, false, false, false, false);
-            dlg.log("Saved integrated starless comet stack: " + cometSavePath);
+            // Saved straight away so a later failure loses no work; overwritten by the
+            // cleaned stack below when the residual-star pass runs.
+            cometWin.saveAs(cometStarlessPath, false, false, false, false);
+            dlg.log("Saved integrated starless comet stack: " + cometStarlessPath);
          } catch (e) {
             dlg.log("Note: could not save the intermediate comet stack (" + (e && e.message ? e.message : e) + ").");
          }
@@ -1894,7 +1897,8 @@ function CometStackDialog() {
             dlg.log("Running StarNet2 on the integrated comet stack to remove faint residual stars...");
             removeResidualStarsFromStack(cometWin, positions[0][0], positions[0][1], dlg.log);
             try {
-               cometWin.saveAs(dlg.workDir + "/CometStack_cometStack_clean.xisf", false, false, false, false);
+               cometWin.saveAs(cometStarlessPath, false, false, false, false);
+               dlg.log("Saved cleaned starless comet stack: " + cometStarlessPath);
             } catch (e) {
                dlg.log("Note: could not save the cleaned comet stack (" + (e && e.message ? e.message : e) + ").");
             }
@@ -1904,13 +1908,15 @@ function CometStackDialog() {
          dlg.status2.text = "Isolating stars and screen-blending...";
          let starSource = dlg.orderedEntries[0].path;
          let cometPathSegment = null;
+         let deepStarStackPath = null; // temporary: deleted once the final image exists
          if (DEEP_STAR_LAYER) {
             try {
                dlg.status2.text = "Integrating all star-aligned frames for the star layer...";
                dlg.log("Integrating all " + dlg.orderedEntries.length + " star-aligned frames into a deep star stack...");
                starSource = buildDeepStarStack(dlg.orderedEntries.map(function(e) { return e.path; }), dlg.workDir);
+               deepStarStackPath = starSource;
                cometPathSegment = [positions[0], positions[positions.length - 1]];
-               dlg.log("Saved deep star stack: " + starSource);
+               dlg.log("Built deep star stack.");
             } catch (e) {
                if (e instanceof UserStoppedError) throw e;
                starSource = dlg.orderedEntries[0].path;
@@ -1921,7 +1927,12 @@ function CometStackDialog() {
             dlg.status2.text = "Isolating stars and screen-blending...";
          }
          dlg.log("Isolating stars (" + (cometPathSegment ? "deep star stack" : "single reference frame") + ") and blending over comet stack...");
-         let finalWin = combine(starSource, cometWin, dlg.workDir, cometPathSegment);
+         let finalWin;
+         try {
+            finalWin = combine(starSource, cometWin, dlg.workDir, cometPathSegment);
+         } finally {
+            if (deepStarStackPath && File.exists(deepStarStackPath)) File.remove(deepStarStackPath);
+         }
          applyAutoSTF(finalWin.mainView, 2.8, 0.16);
          finalWin.zoomToFit();
          finalWin.show();
@@ -1929,8 +1940,14 @@ function CometStackDialog() {
 
          let savePath = dlg.workDir + "/CometStack_final.xisf";
          finalWin.saveAs(savePath, false, false, false, false);
+         // Outputs written by earlier versions of this script, superseded by the two files above.
+         ["CometStack_cometStack.xisf", "CometStack_cometStack_clean.xisf", "CometStack_starStack.xisf"].forEach(function(name) {
+            let old = dlg.workDir + "/" + name;
+            if (File.exists(old)) { File.remove(old); dlg.log("Removed superseded file: " + name); }
+         });
          dlg.status2.text = "Completed! Saved to " + savePath;
-         dlg.log("Finished! Final image saved to: " + savePath);
+         dlg.log("Finished! Final image (comet + stars) saved to: " + savePath);
+         dlg.log("Starless comet saved to: " + cometStarlessPath);
          dlg.isCompleted = true;
          setHighlight(dlg.closeButton, true);
       } catch (e) {
@@ -1940,7 +1957,7 @@ function CometStackDialog() {
          } else {
             dlg.status2.text = "Stacking failed — see error dialog or log.";
             if (ImageWindow.windowById("cometStackLayer") && !ImageWindow.windowById("cometStackLayer").isNull)
-               dlg.log("The integrated comet stack is still open as 'cometStackLayer' and is saved as CometStack_cometStack.xisf in the work folder.");
+               dlg.log("The integrated comet stack is still open as 'cometStackLayer' and is saved as CometStack_comet_starless.xisf in the work folder.");
             showErrorDialog("Comet Stack", e, dlg.log);
          }
       } finally {
